@@ -59,7 +59,6 @@ class CocotbDebugger:
             try:
                 self._send_line(conn_file, b"# cocotb-dbg ready. Single-line mode: press Enter to run. Use :paste / :end for blocks. :quit to exit.")
             except Exception:
-                # If the peer closed immediately, just stop handling.
                 return
 
             buf: list[bytes] = []
@@ -84,7 +83,7 @@ class CocotbDebugger:
                             self._send_line(conn_file, ln.encode("utf-8", "replace"))
                         self._send_line(conn_file, b"<<END>>")
                     except Exception:
-                        break  # peer likely closed; exit handler
+                        break
                 else:
                     buf.append(line)
         finally:
@@ -97,7 +96,6 @@ class CocotbDebugger:
         try:
             f.write(data if data.endswith(b"\n") else data + b"\n")
         except Exception:
-            # Let caller decide whether to continue/exit; avoid noisy tracebacks.
             raise
 
 
@@ -138,7 +136,6 @@ def format_exception() -> str:
 # Launcher / Client (CLI)
 # =======================
 
-BANNER = "[cocotb-dbg] listening on"
 HOST = "127.0.0.1"
 PORT = 9999
 
@@ -174,10 +171,9 @@ def _wait_for_port(host: str, port: int, timeout: float = 30.0) -> bool:
 def _client_loop():
     print(f"Connecting to {HOST}:{PORT} ...")
     with socket.create_connection((HOST, PORT)) as s, s.makefile("rwb", buffering=0) as f:
-        # read single-line banner from server
         banner = f.readline().decode().rstrip()
         print(banner)
-        print("# Single-line mode: each Enter executes. Use :paste for multi-line, end with :end. :quit to exit.") # TODO: auto detect multi line with ':' at the end of line (ex if (dut.a.value < 5:))
+        print("# Single-line mode: each Enter executes. Use :paste for multi-line, end with :end. :quit to exit.")  # TODO: auto detect blocks
         while True:
             try:
                 line = input(">>> ")
@@ -199,12 +195,10 @@ def _client_loop():
                     if pl.strip() == ":end":
                         break
                     buf.append(pl)
-                # send the multi-line block followed by a blank line
                 for ln in buf:
                     f.write(ln.encode() + b"\n")
                 f.write(b"\n")
             else:
-                # immediate single-line execution: send line + blank line
                 f.write(line.encode() + b"\n")
                 f.write(b"\n")
 

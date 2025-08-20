@@ -1,6 +1,3 @@
-#####################################################################################
-# TODO: FIX clk incrementing when we send commands (seems to be 1 step per command) #
-#####################################################################################
 import cocotb
 from cocotb.triggers import Timer, RisingEdge, FallingEdge, Event
 from cocotb.clock import Clock
@@ -11,6 +8,7 @@ from cocodbg import CocotbDebugger, wrap_code_as_async, format_exception
 import queue
 import io
 import contextlib
+import inspect
 
 DBG_HOST = "127.0.0.1"
 DBG_PORT = 9999
@@ -37,12 +35,50 @@ async def cocodbg(dut):
     dbg.start()
     dut._log.info(f"[cocotb-dbg] listening on {DBG_HOST}:{DBG_PORT}")
 
-    # ---- Clock control & run-control (exposed to REPL) ----
+    # Clock/run control exposed in the REPL
     CLK = {"task": None, "period_ns": 10.0}  # default 100 MHz
+
+    # helpers: time conversion
+    def _to_ns(value, units: str) -> float:
+        units = units.lower()
+        if units == "fs": return float(value) * 1e-6
+        if units == "ps": return float(value) * 1e-3
+        if units == "ns": return float(value)
+        if units == "us": return float(value) * 1e3
+        if units == "ms": return float(value) * 1e6
+        if units == "s":  return float(value) * 1e9
+        raise ValueError(f"Unsupported units for period: {units}")
+
+    def _to_total_ps(value, units: str) -> int:
+        units = units.lower()
+        if units == "fs": return int(round(float(value) / 1000.0))
+        if units == "ps": return int(round(float(value)))
+        if units == "ns": return int(round(float(value) * 1_000.0))
+        if units == "us": return int(round(float(value) * 1_000_000.0))
+        if units == "ms": return int(round(float(value) * 1_000_000_000.0))
+        if units == "s":  return int(round(float(value) * 1_000_000_000_000.0))
+        raise ValueError(f"Unsupported units for time: {units}")
+
+    async def _await_time_ps(ps: int):
+        """
+        Await an integer amount of time in picoseconds, chunked by s/ms/us/ns/ps.
+        Avoids float drift AND avoids huge loops for long durations.
+        """
+        if ps <= 0:
+            return
+        for unit, factor in (("s", 1_000_000_000_000),
+                             ("ms",    1_000_000_000),
+                             ("us",        1_000_000),
+                             ("ns",            1_000),
+                             ("ps",                1)):
+            count, ps = divmod(ps, factor)
+            if count:
+                await Timer(int(count), units=unit)
 
     async def start_clock(period_ns: float | None = None):
         """
-        Start a free-running clock on dut.clk with given period (ns).
+        Start a FREE-RUNNING clock on dut.clk with given period (ns).
+        WARNING: Once started, time will advance autonomously until stop_clock().
         """
         p = float(period_ns if period_ns is not None else CLK["period_ns"])
         if CLK["task"] is not None:
@@ -51,46 +87,124 @@ async def cocodbg(dut):
         CLK["period_ns"] = p
         CLK["task"] = cocotb.start_soon(Clock(dut.clk, p, units="ns").start())
 
-    async def stop_clock():
+    async def stop_clock(freeze: str = "low"):
         """
-        Stop the free-running clock.
+        Stop the free-running clock (if running) and freeze level.
+        freeze: "low" (default), "high", or "preserve"
         """
         if CLK["task"] is not None:
             CLK["task"].kill()
             CLK["task"] = None
+        if freeze == "low":
+            with contextlib.suppress(Exception):
+                dut.clk.value = 0
+        elif freeze == "high":
+            with contextlib.suppress(Exception):
+                dut.clk.value = 1
+        # "preserve" => leave current level
+
+    async def set_clock_rate(period_value, units: str = "ns"):
+        """
+        Set the default clock period used by run_for / cycles.
+        Leaves the clock STOPPED (frozen low for determinism).
+        """
+        await stop_clock(freeze="low")
+        CLK["period_ns"] = _to_ns(period_value, units)
 
     async def step():
-        """
-        Advance exactly one delta cycle (no time advance).
-        """
+        """Advance exactly one delta (no time advance)."""
         await Timer(1, units="step")
 
-    async def run_for(t, units: str = "ns", step_ns: float | None = None):
+    async def cycles(n: int, period_ns: float | None = None):
         """
-        Advance time by t in given units (default: ns).
+        Drive EXACTLY n clock cycles *manually* (no background run afterwards).
+        - If a free-running clock is active, stop it first (avoid double-driving).
+        - period_ns defaults to CLK["period_ns"].
+        - Uses integer picoseconds throughout, so it's drift-free.
         """
-        if units == "ns":
-            chunk = 0.1 if step_ns is None else float(step_ns)
-            remaining = float(t)
-            while remaining > 0:
-                dt = chunk if remaining >= chunk else remaining
-                await Timer(dt, units="ns")
-                remaining -= dt
-        else:
-            await Timer(t, units=units)
+        if CLK["task"] is not None:
+            await stop_clock()
 
-    async def cycles(n: int):
-        """
-        Advance exactly n clock cycles (requires a running clock).
-        """
+        p_ns = float(CLK["period_ns"] if period_ns is None else period_ns)
+        period_ps = int(round(p_ns * 1_000.0))  # 1 ns = 1000 ps
+        half_ps = period_ps // 2
+        first_half_ps = half_ps + (period_ps - 2 * half_ps)
+        second_half_ps = half_ps
+
+        with contextlib.suppress(Exception):
+            dut.clk.value = 0
+
         for _ in range(int(n)):
-            await RisingEdge(dut.clk)
+            await _await_time_ps(first_half_ps)
+            dut.clk.value = 1
+            await _await_time_ps(second_half_ps)
+            dut.clk.value = 0
 
-    # Start a default clock so RisingEdge(dut.clk) can be used when YOU let time advance.
-    # With no auto-idle progression, the clock will not toggle unless time is moved by commands.
-    cocotb.start_soon(Clock(dut.clk, CLK["period_ns"], units="ns").start())
+    async def _temp_free_run_for_ps(total_ps: int, freeze: str = "preserve"):
+        """
+        Phase-safe temporary free run:
+          - Starts at clk=0.
+          - Manually toggles using the configured period for at most total_ps.
+          - Guarantees NO rising edge if total_ps < half-period.
+          - At the end, 'freeze' controls the final level: "preserve" | "low" | "high".
+        """
+        if total_ps <= 0:
+            return
 
-    # REPL environment: names injected into every command.
+        p_ns = float(CLK["period_ns"])
+        period_ps = int(round(p_ns * 1_000.0))  # 1 ns = 1000 ps
+        half_ps = period_ps // 2
+        first_half_ps = half_ps + (period_ps - 2 * half_ps)
+        second_half_ps = half_ps
+
+        # start from a known phase
+        lvl = 0
+        with contextlib.suppress(Exception):
+            dut.clk.value = lvl
+
+        rem = int(total_ps)
+        while rem > 0:
+            # first half, no rising edge if we can't fit it
+            if rem < first_half_ps:
+                await _await_time_ps(rem)
+                break
+            await _await_time_ps(first_half_ps)
+            lvl = 1
+            dut.clk.value = lvl
+            rem -= first_half_ps
+
+            # second half, if we can't fit it, we stop high
+            if rem < second_half_ps:
+                await _await_time_ps(rem)
+                break
+            await _await_time_ps(second_half_ps)
+            lvl = 0
+            dut.clk.value = lvl
+            rem -= second_half_ps
+
+        # final freeze policy
+        if freeze == "low" and lvl != 0:
+            dut.clk.value = 0 # may create a zero-time falling edge
+        elif freeze == "high" and lvl != 1:
+            dut.clk.value = 1 # may create a zero-time rising edge
+        # "preserve" => do nothing
+
+    async def run_for(t, units: str = "ns", freeze: str = "preserve"):
+        """
+        Advance real time by t, ALWAYS updating the design with clock edges.
+          - If a free-running clock is active: just await t (edges come from it).
+          - Else: run a phase-safe temporary clock for exactly t, then freeze as requested.
+        freeze: "preserve" (default), "low", or "high"
+        """
+        total_ps = _to_total_ps(t, units)
+
+        if CLK["task"] is not None:
+            await _await_time_ps(total_ps)
+            return
+
+        await _temp_free_run_for_ps(total_ps, freeze=freeze)
+
+    # REPL environment: names injected into every snippet
     exec_globals = {
         # DUT + cocotb primitives
         "dut": dut,
@@ -101,10 +215,10 @@ async def cocodbg(dut):
         "FallingEdge": FallingEdge,
         "Clock": Clock,
         "BinaryValue": BinaryValue,
-
-        # time control
+        # time/clock control
         "start_clock": start_clock,
         "stop_clock": stop_clock,
+        "set_clock_rate": set_clock_rate,
         "step": step,
         "run_for": run_for,
         "cycles": cycles,
@@ -118,10 +232,9 @@ async def cocodbg(dut):
             try:
                 code, reply_q, addr = dbg.cmd_q.get_nowait()
             except queue.Empty:
-                # DO NOT SCHEDULE DELTAS HERE, just yield once and loop (no time advance, no starvation)
+                # Idle: a single delta keeps the loop responsive without moving time.
                 await Timer(1, units="step")
                 continue
-       
             code = format_user_input(code)
             wrapper = wrap_code_as_async(code)
             exec_locals = {}
@@ -131,30 +244,26 @@ async def cocodbg(dut):
                 coro = exec_locals["__user_main__"]()
                 with contextlib.redirect_stdout(out):
                     result = await coro
+                
+                # If last expression produced an awaitable (coroutine/Trigger/Future), auto-await it.
+                if inspect.isawaitable(result):
+                    result = await result
 
                 printed = out.getvalue()
                 if printed:
-                    payload = ["[OK]"]
-                    payload.append("## stdout:")
-                    payload.append(printed.rstrip("\n"))
-                    payload.append("## return:")
-                    payload.append(_fmt_result(result))
+                    payload = ["[OK]", "## stdout:", printed.rstrip("\n"), "## return:", _fmt_result(result)]
                 else:
                     payload = [f"[OK] {_fmt_result(result)}"]
-
                 msg = "\n".join(payload)
 
             except Exception:
                 printed = out.getvalue()
                 if printed:
-                    payload = ["[ERROR]"]
-                    payload.append("## stdout (partial):")
-                    payload.append(printed.rstrip("\n"))
-                    payload.append("## traceback:")
-                    payload.append(format_exception().rstrip("\n"))
+                    payload = ["[ERROR]", "## stdout (partial):", printed.rstrip("\n"), "## traceback:", format_exception().rstrip("\n")]
                 else:
                     payload = [f"[ERROR] {format_exception().rstrip()}"]
                 msg = "\n".join(payload)
+
             reply_q.put(msg)
 
     def _fmt_result(val):
@@ -194,8 +303,6 @@ async def cocodbg(dut):
 
     cocotb.start_soon(executor_loop())
 
-    # Keep the test alive WITHOUT advancing time or scheduling endless deltas.
-    # It waits on an Event that we never set.
-    # This avoids starving timed triggers while ensuring the test never returns.
+    # Keep the test alive WITHOUT advancing time (wait on an Event we never set)
     never = Event()
     await never.wait()
