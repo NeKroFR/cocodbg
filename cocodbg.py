@@ -63,7 +63,7 @@ class CocotbDebugger:
         try:
             # Single short banner to avoid client/server desync
             try:
-                self._send_line(conn_file, b"# cocotb-dbg ready. Single-line mode: press Enter to run. Use :paste / :end for blocks. :quit to exit.")
+                self._send_line(conn_file, b"# cocotb-dbg ready. :quit to exit.")
             except Exception:
                 return
 
@@ -137,7 +137,9 @@ _RESERVED_GLOBALS = {
 }
 
 def _collect_store_names(node: ast.AST) -> set[str]:
-    """Collect Name ids in Store context from an arbitrary target node."""
+    """
+    Collect Name ids in Store context from an arbitrary target node.
+    """
     names: set[str] = set()
     class StoreVisitor(ast.NodeVisitor):
         def visit_Name(self, n: ast.Name):
@@ -316,43 +318,40 @@ def _client_loop():
     with socket.create_connection((HOST, PORT)) as s, s.makefile("rwb", buffering=0) as f:
         banner = f.readline().decode().rstrip()
         print(banner)
-        print("# Single-line mode: each Enter executes. Use :paste for multi-line, end with :end. :quit to exit.")  # TODO: auto detect blocks
+        print("# Auto-detect blocks: lines ending with ':' start a block; finish a block with a blank line. :quit to exit.")
 
         _history_init()
-        while True:
+
+        buf: list[str] = []
+        indent_levels = 0
+
+        def _set_default_indent(level: int):
+            """Pre-fill the input line with indentation for a nicer UX."""
+            spaces = " " * (max(level, 0) * 4)
+
+            def hook():
+                try:
+                    readline.insert_text(spaces)
+                    readline.redisplay()
+                finally:
+                    readline.set_pre_input_hook(None)
+
             try:
-                line = input(">>> ")
-            except EOFError:
-                line = ":quit"
+                if sys.stdin.isatty():
+                    readline.set_pre_input_hook(hook)
+            except Exception:
+                pass
 
-            if line.strip() == ":quit":
-                f.write(b":quit\n")
-                break
-
-            if line.strip() == ":paste":
-                print("# Paste your code. Finish with a line containing only :end")
-                buf = []
-                while True:
-                    try:
-                        pl = input("... ")
-                    except EOFError:
-                        pl = ":end"
-                    if pl.strip() == ":end":
-                        break
-                    buf.append(pl)
-                for ln in buf:
-                    f.write(ln.encode() + b"\n")
-                f.write(b"\n")
-            else:
-                _history_add_line(line)
-                f.write(line.encode() + b"\n")
-                f.write(b"\n")
+        def _send_code_and_read_reply(code: str):
+            for ln in code.splitlines():
+                f.write(ln.encode() + b"\n")
+            f.write(b"\n")
 
             # read framed reply
             start = f.readline().decode().rstrip()
             if start != "<<BEGIN>>":
                 print("# Protocol error (no BEGIN)")
-                continue
+                return
             payload_lines = []
             while True:
                 ln = f.readline().decode().rstrip()
@@ -360,6 +359,47 @@ def _client_loop():
                     break
                 payload_lines.append(ln)
             print("\n".join(payload_lines))
+
+        while True:
+            prompt = ">>> " if not buf else "... "
+
+            if buf or indent_levels > 0:
+                _set_default_indent(indent_levels)
+            try:
+                line = input(prompt)
+            except EOFError:
+                line = ":quit"
+
+            if line.strip() == ":quit":
+                f.write(b":quit\n")
+                break
+
+            if not buf and line.strip() == "":
+                continue
+
+            # SINGLE-LINE MODE
+            starts_block = line.rstrip().endswith(":")
+            if not buf and not starts_block:
+                _history_add_line(line)
+                _send_code_and_read_reply(line)
+                indent_levels = 0
+                continue
+
+            # BLOCK MODE
+            if line.strip() == "":
+                code = "\n".join(buf)
+                buf.clear()
+                _history_add_line(code)
+                _send_code_and_read_reply(code)
+                indent_levels = 0
+                continue
+            buf.append(line)
+
+            # Compute indentation for the next line:
+            stripped = line.lstrip(" ")
+            leading_spaces = len(line) - len(stripped)
+            current_level = max(leading_spaces // 4, 0)
+            indent_levels = current_level + (1 if stripped.endswith(":") else 0)
 
 def start_sim(sim_dir):
     """

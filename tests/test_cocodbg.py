@@ -2,6 +2,7 @@ import cocotb
 from cocotb.triggers import Timer, RisingEdge, FallingEdge, Event
 from cocotb.clock import Clock
 from cocotb.binary import BinaryValue
+from cocotb.handle import ModifiableObject
 
 from cocodbg import CocotbDebugger, wrap_code_as_async, format_exception
 
@@ -9,6 +10,7 @@ import queue
 import io
 import contextlib
 import inspect
+import operator
 
 DBG_HOST = "127.0.0.1"
 DBG_PORT = 9999
@@ -204,6 +206,25 @@ async def cocodbg(dut):
 
         await _temp_free_run_for_ps(total_ps, freeze=freeze)
 
+    ### Comparison helpers + auto-coercing comparisons ###
+    def as_uint(x):
+        """
+        Unsigned int view of a cocotb handle or BinaryValue (raises on X/Z).
+        """
+        v = getattr(x, "value", x)
+        if hasattr(v, "integer"):
+            return int(v.integer)
+        return int(v)
+
+    def as_sint(x):
+        """
+        Signed int view (uses BinaryValue.signed_integer if available).
+        """
+        v = getattr(x, "value", x)
+        if hasattr(v, "signed_integer"):
+            return int(v.signed_integer)
+        return int(v)
+
     # REPL environment: names injected into every snippet
     exec_globals = {
         # DUT + cocotb primitives
@@ -215,6 +236,7 @@ async def cocodbg(dut):
         "FallingEdge": FallingEdge,
         "Clock": Clock,
         "BinaryValue": BinaryValue,
+
         # time/clock control
         "start_clock": start_clock,
         "stop_clock": stop_clock,
@@ -222,7 +244,31 @@ async def cocodbg(dut):
         "step": step,
         "run_for": run_for,
         "cycles": cycles,
+
+        # comparison helpers
+        "as_uint": as_uint,
+        "as_sint": as_sint,
     }
+
+    # Compare DUT elements (unsigned for now)
+    # TODO: Add signed comparison
+    def _cmpwrap(op):
+        def _impl(self, other):
+            try:
+                return op(as_uint(self), as_uint(other))
+            except Exception:
+                return NotImplemented
+        return _impl
+    for _cls in (c for c in (BinaryValue, ModifiableObject) if c is not None):
+        _cls.__lt__ = _cmpwrap(operator.lt)
+        _cls.__le__ = _cmpwrap(operator.le)
+        _cls.__gt__ = _cmpwrap(operator.gt)
+        _cls.__ge__ = _cmpwrap(operator.ge)
+        # keep existing eq/ne if they exist; else provide them
+        if getattr(_cls, "__eq__", object.__eq__) is object.__eq__:
+            _cls.__eq__ = _cmpwrap(operator.eq)
+        if getattr(_cls, "__ne__", object.__ne__) is object.__ne__:
+            _cls.__ne__ = _cmpwrap(operator.ne)
 
     async def executor_loop():
         """
