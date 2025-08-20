@@ -9,6 +9,8 @@ import time
 import subprocess
 from typing import Tuple
 import ast
+import readline
+
 
 # =======================
 # Server & helper classes
@@ -98,6 +100,27 @@ class CocotbDebugger:
         except Exception:
             raise
 
+def _history_init():
+    """
+    Enable in-memory arrow-key history to navigate through snippets.
+    """
+    readline.set_auto_history(False) # Fix pressing arrow twice issue
+    readline.clear_history()
+
+def _history_add_line(line: str):
+    """
+    Add a line to in-memory history unless it would duplicate the last item.
+
+    NOTE: We don't append commands yet (lines starting with ":")
+    """
+    if not line.strip():
+        return
+    if line.lstrip().startswith(":"):
+        return
+    n = readline.get_current_history_length()
+    last = readline.get_history_item(n) if n > 0 else None
+    if last != line:
+        readline.add_history(line)
 
 def wrap_code_as_async(code: str) -> str:
     """
@@ -174,6 +197,8 @@ def _client_loop():
         banner = f.readline().decode().rstrip()
         print(banner)
         print("# Single-line mode: each Enter executes. Use :paste for multi-line, end with :end. :quit to exit.")  # TODO: auto detect blocks
+
+        _history_init()
         while True:
             try:
                 line = input(">>> ")
@@ -199,6 +224,7 @@ def _client_loop():
                     f.write(ln.encode() + b"\n")
                 f.write(b"\n")
             else:
+                _history_add_line(line)
                 f.write(line.encode() + b"\n")
                 f.write(b"\n")
 
