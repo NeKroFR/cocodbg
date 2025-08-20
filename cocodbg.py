@@ -42,17 +42,21 @@ class CocotbDebugger:
         self._stop_evt.set()
 
     def _serve(self):
-        with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((self.host, self.port))
             s.listen(5)
+            s.settimeout(0.5)
             while not self._stop_evt.is_set():
                 try:
-                    s.settimeout(0.5)
                     conn, addr = s.accept()
                 except socket.timeout:
                     continue
                 threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True).start()
+        finally:
+            with contextlib.suppress(Exception):
+                s.close()
 
     def _handle_client(self, conn: socket.socket, addr):
         conn_file = conn.makefile(mode="rwb", buffering=0)
@@ -122,14 +126,129 @@ def _history_add_line(line: str):
     if last != line:
         readline.add_history(line)
 
+#### Helpers for persistent variables via AST ####
+
+# Names that already exist in the REPL environment
+# (avoid forcing these through 'global' unless the user explicitly rebinds them).
+_RESERVED_GLOBALS = {
+    "dut", "clk", "cocotb", "Timer", "RisingEdge", "FallingEdge",
+    "Clock", "BinaryValue",
+    "start_clock", "stop_clock", "set_clock_rate", "step", "run_for", "cycles",
+}
+
+def _collect_store_names(node: ast.AST) -> set[str]:
+    """Collect Name ids in Store context from an arbitrary target node."""
+    names: set[str] = set()
+    class StoreVisitor(ast.NodeVisitor):
+        def visit_Name(self, n: ast.Name):
+            if isinstance(n.ctx, ast.Store):
+                names.add(n.id)
+        def visit_Attribute(self, n: ast.Attribute):
+            # Attribute targets (obj.attr) don't introduce new names in scope
+            self.generic_visit(n.value)
+        def visit_List(self, n: ast.List):
+            for elt in n.elts:
+                self.visit(elt)
+        def visit_Tuple(self, n: ast.Tuple):
+            for elt in n.elts:
+                self.visit(elt)
+    StoreVisitor().visit(node)
+    return names
+
+def _assigned_at_toplevel(tree: ast.Module) -> set[str]:
+    """
+    Return names that are assigned/bound at the user's top level (not inside
+    nested function/class/lambda scopes).
+    Includes: Assign/AugAssign/AnnAssign targets, For/AsyncFor targets,
+    With/AsyncWith 'as' vars, Try except aliases, NamedExpr (walrus),
+    Import/ImportFrom aliases, and names of def/class statements.
+    """
+    assigned: set[str] = set()
+
+    def visit_stmt(node: ast.stmt, nested_scope: bool):
+        # New scope creators (don't traverse into body)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if not nested_scope:
+                assigned.add(node.name)
+            return
+        if isinstance(node, ast.ClassDef):
+            if not nested_scope:
+                assigned.add(node.name)
+            return
+        if isinstance(node, ast.Lambda):
+            return
+
+        # Imports
+        if not nested_scope and isinstance(node, ast.Import):
+            for alias in node.names:
+                assigned.add(alias.asname or alias.name.split(".", 1)[0])
+        if not nested_scope and isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                assigned.add(alias.asname or alias.name)
+
+        # Assignments
+        if not nested_scope and isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = []
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            elif isinstance(node, ast.AugAssign):
+                targets = [node.target]
+            for t in targets:
+                assigned.update(_collect_store_names(t))
+
+        # For/AsyncFor targets
+        if not nested_scope and isinstance(node, (ast.For, ast.AsyncFor)):
+            assigned.update(_collect_store_names(node.target))
+
+        # With/AsyncWith 'as' vars
+        if not nested_scope and isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    assigned.update(_collect_store_names(item.optional_vars))
+
+        # Try/Except alias "as e"
+        if not nested_scope and isinstance(node, ast.Try):
+            for h in node.handlers:
+                if h.name:
+                    assigned.add(h.name)
+
+        # Walrus operator at top level
+        if not nested_scope:
+            class WalrusVisitor(ast.NodeVisitor):
+                def visit_NamedExpr(self, n: ast.NamedExpr):
+                    assigned.update(_collect_store_names(n.target))
+                    self.generic_visit(n.value)
+            WalrusVisitor().visit(node)
+
+        # Recurse into non-scope child statements
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, list):
+                for child in value:
+                    if isinstance(child, ast.stmt):
+                        visit_stmt(child, nested_scope)
+            elif isinstance(value, ast.stmt):
+                visit_stmt(value, nested_scope)
+
+    for top in tree.body:
+        visit_stmt(top, nested_scope=False)
+
+    return {n for n in assigned if n not in _RESERVED_GLOBALS}
+
 def wrap_code_as_async(code: str) -> str:
     """
     Wrap arbitrary user code into an async function __user_main__().
     - If the last statement is an expression (incl. `await ...`), return it so the REPL shows its value.
     - Empty lines become 'pass' to keep indentation valid.
+    - Names assigned at the user's top level are declared 'global' so values persist.
     """
+    globals_line = ""
     try:
         tree = ast.parse(code, mode="exec")
+        assigned = sorted(_assigned_at_toplevel(tree))
+        if assigned:
+            globals_line = "    global " + ", ".join(assigned) + "\n"
         if tree.body:
             last = tree.body[-1]
             if isinstance(last, ast.Expr) and hasattr(last, "lineno"):
@@ -141,14 +260,15 @@ def wrap_code_as_async(code: str) -> str:
                     expr_src = "\n".join(lines[start:end + 1]).strip()
                 kept = lines[:start] + lines[end + 1:]
                 indented = [("    " + ln) if ln.strip() else "    pass" for ln in kept]
-                indented.append(f"    return ({expr_src})")
-                body = "\n".join(indented) or "    pass"
+                body = globals_line + ("\n".join(indented) + ("\n" if indented else "")) + f"    return ({expr_src})"
                 return f"async def __user_main__():\n{body}\n"
+
     except Exception:
         pass
 
     indented = [("    " + ln) if ln.strip() else "    pass" for ln in code.splitlines()]
-    body = "\n".join(indented) or "    pass"
+    body_core = "\n".join(indented) or "    pass"
+    body = (globals_line + body_core) if globals_line else body_core
     return f"async def __user_main__():\n{body}\n"
 
 
