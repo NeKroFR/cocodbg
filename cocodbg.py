@@ -370,7 +370,7 @@ def _client_loop():
             except EOFError:
                 line = ":quit"
 
-            if line.strip() == ":quit":
+            if line.strip() == ":quit" or line.strip() == ":q":
                 f.write(b":quit\n")
                 break
 
