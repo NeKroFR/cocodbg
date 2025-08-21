@@ -408,6 +408,7 @@ def start_sim(sim_dir):
     env = os.environ.copy()
     extra_py = os.path.abspath(".") + os.pathsep + os.path.abspath(sim_dir)
     env["PYTHONPATH"] = extra_py + os.pathsep + env.get("PYTHONPATH", "")
+    env["COCODBG_ROOT"] = os.path.abspath(os.getcwd())
 
     print("starting simulation...")
     sim_proc = subprocess.Popen(

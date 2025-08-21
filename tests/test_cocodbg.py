@@ -1,8 +1,10 @@
+import os
 import cocotb
-from cocotb.triggers import Timer, RisingEdge, FallingEdge, Event
+from cocotb.triggers import Timer, RisingEdge, FallingEdge, Event, Edge
 from cocotb.clock import Clock
 from cocotb.binary import BinaryValue
-from cocotb.handle import ModifiableObject
+from cocotb.handle import ModifiableObject, SimHandleBase
+from cocotb.utils import get_sim_time
 
 from cocodbg import CocotbDebugger, wrap_code_as_async, format_exception
 
@@ -225,6 +227,265 @@ async def cocodbg(dut):
             return int(v.signed_integer)
         return int(v)
 
+    VCD = {
+        "pairs": [], # [(hier_name, handle)]
+        "ids": {}, # handle -> vcd_id
+        "events": [], # [(time_ps: int, vcd_id: str, change_line: str)]
+        "rec_active": True,
+        "mark_start_ps": None,
+        "mark_stop_ps":  None,
+        "selected_ids": None,
+    }
+
+    def _resolve_out_path(path: str) -> str:
+        base = os.environ.get("COCODBG_ROOT", os.getcwd())
+        return path if os.path.isabs(path) else os.path.join(base, path)
+
+    def _collect_leaf_signals(root) -> list[tuple[str, ModifiableObject]]:
+        """
+        Collect (hier_name_relative_to_dut, handle) for leaf ModifiableObject
+        signals under 'root', using iteration so prior attribute access is not required.
+        """
+        out: list[tuple[str, ModifiableObject]] = []
+
+        def iter_children(node):
+            """
+            Iterate over children of a node, yielding (name, child) pairs.
+            """
+            for ch in node:
+                name = getattr(ch, "_name", None) or getattr(ch, "name", None)
+                if name is None:
+                    fullname = getattr(ch, "_fullname", str(ch))
+                    name = str(fullname).split(".")[-1]
+                yield name, ch
+        
+        def rec(node, prefix: str):
+            """
+            Walk children to find all leaf ModifiableObject signals.
+            """
+            if isinstance(node, ModifiableObject):
+                out.append((prefix or getattr(node, "_name", "sig"), node))
+                return
+
+            got_child = False
+            for name, child in iter_children(node):
+                got_child = True
+                child_name = f"{prefix}.{name}" if prefix else name
+                rec(child, child_name)
+
+            if not got_child and isinstance(node, SimHandleBase):
+                if isinstance(node, ModifiableObject):
+                    out.append((prefix or getattr(node, "_name", "sig"), node))
+
+        # start with empty prefix so names are relative to 'dut'
+        rec(root, "")
+
+        # Deduplicate by object identity
+        unique: dict[int, tuple[str, ModifiableObject]] = {}
+        for name, handle in out:
+            unique.setdefault(id(handle), (name, handle))
+        return list(unique.values())
+
+    def _bv_width(val: BinaryValue) -> int:
+        try:
+            return int(val.n_bits)
+        except Exception:
+            try:
+                return len(val.binstr)
+            except Exception:
+                return -1
+
+    def _vcd_safe_name(name: str) -> str:
+        return name.replace(" ", "_")
+
+    def _vcd_id_generator():
+        """
+        Generate unique VCD IDs.
+        """
+        charset = [chr(c) for c in range(33, 127)]
+        counter = [0]
+        def next_id():
+            i = counter[0]
+            s = ""
+            base = len(charset)
+            if i == 0:
+                s = charset[0]
+            else:
+                while i > 0:
+                    s = charset[i % base] + s
+                    i //= base
+            counter[0] += 1
+            return s
+        return next_id
+
+    def _fmt_change(sig: ModifiableObject, vcd_id: str) -> str:
+        """
+        Format a change event for a VCD signal.
+        """
+        v = sig.value
+        w = _bv_width(v)
+
+        try:
+            b = v.binstr.lower()
+        except Exception:
+            try:
+                b = format(int(v), "b")
+            except Exception:
+                b = "x" if w == 1 else "x" * max(1, w)
+        if w <= 1 and len(b) == 1:
+            return f"{b}{vcd_id}\n"
+        return f"b{b} {vcd_id}\n"
+
+    def _scale_ps(ps: int, unit: str) -> int:
+        unit = unit.lower()
+        if unit == "fs": return ps * 1000
+        if unit == "ps": return ps
+        if unit == "ns": return ps // 1_000
+        if unit == "us": return ps // 1_000_000
+        if unit == "ms": return ps // 1_000_000_000
+        if unit == "s":  return ps // 1_000_000_000_000
+        raise ValueError(f"Unsupported timescale unit: {unit}")
+
+    async def _monitor_signal(sig: ModifiableObject, vcd_id: str):
+        """
+        Append (time_ps, id, change_line) on each edge if recording is active
+        """
+        while True:
+            await Edge(sig)
+            if not VCD["rec_active"]:
+                continue
+            t_ps = int(get_sim_time(units="ps"))
+            VCD["events"].append((t_ps, vcd_id, _fmt_change(sig, vcd_id)))
+
+    def _ensure_vcd_monitors_initialized():
+        """
+        Ensure VCD monitors are initialized, if not initialize them.
+        """
+        if VCD["pairs"]:
+            return
+        pairs = _collect_leaf_signals(dut)
+        next_id = _vcd_id_generator()
+        ids = {sig: next_id() for _, sig in pairs}
+        VCD["pairs"] = pairs
+        VCD["ids"] = ids
+
+        t_ps = int(get_sim_time(units="ps"))
+        for _, sig in pairs:
+            change = _fmt_change(sig, ids[sig])
+            VCD["events"].append((t_ps, ids[sig], change))
+
+        for _, sig in pairs:
+            cocotb.start_soon(_monitor_signal(sig, ids[sig]))
+
+    async def start_vcd(signals: list[ModifiableObject] | None = None):
+        """
+        Start (or restart) a VCD recording window from NOW.
+        If 'signals' is provided, limit future gen_vcd() to those signals.
+        """
+        _ensure_vcd_monitors_initialized()
+        VCD["rec_active"] = True
+        VCD["mark_start_ps"] = int(get_sim_time(units="ps"))
+        VCD["mark_stop_ps"] = None
+        if signals is None:
+            VCD["selected_ids"] = None
+        else:
+            # map provided handles to existing ids; unknown handles are ignored
+            selected = set()
+            for s in signals:
+                vid = VCD["ids"].get(s)
+                if vid:
+                    selected.add(vid)
+            VCD["selected_ids"] = selected
+
+    async def stop_vcd():
+        """
+        Stop recording (events after this call are not captured).
+        Window end is marked at NOW.
+        """
+        _ensure_vcd_monitors_initialized()
+        VCD["rec_active"] = False
+        VCD["mark_stop_ps"] = int(get_sim_time(units="ps"))
+
+    async def gen_vcd(path: str, *, timescale: str = "ns"):
+        """
+        Generate a VCD file.
+        ----
+        If `start_vcd()` was called the VCD will be from that moment to `stop_vcd()` (or NOW if it was not called).
+        Otherwise from the beginning (t=0) to NOW.
+        """
+        _ensure_vcd_monitors_initialized()
+        out_path = _resolve_out_path(path)
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+        if VCD["mark_start_ps"] is not None:
+            t_start = VCD["mark_start_ps"]
+        else:
+            t_start = VCD["events"][0][0] if VCD["events"] else 0
+        t_end = VCD["mark_stop_ps"]
+        if t_end is None:
+            t_end = int(get_sim_time(units="ps"))
+
+        # Build signal list to dump
+        if VCD["selected_ids"] is None:
+            pairs = VCD["pairs"]
+            selected_ids = set(VCD["ids"][sig] for _, sig in pairs)
+        else:
+            selected_ids = set(VCD["selected_ids"])
+            pairs = [(n, s) for (n, s) in VCD["pairs"] if VCD["ids"][s] in selected_ids]
+
+        # Precompute starting values at t_start
+        # Walk through events up to t_start and remember last value per id
+        start_vals = {}
+        for t_ps, vid, ch in VCD["events"]:
+            if vid not in selected_ids:
+                continue
+            if t_ps > t_start:
+                break
+            start_vals[vid] = ch
+
+        # If any id lacks a prior event, synthesize from current value
+        for _, sig in pairs:
+            vid = VCD["ids"][sig]
+            if vid not in start_vals:
+                start_vals[vid] = _fmt_change(sig, vid)
+
+        # Write the VCD
+        with open(out_path, "w", buffering=1) as f:
+            from datetime import datetime
+            f.write(f"$date {datetime.now()} $end\n")
+            f.write(f"$version cocotb-dbg vcd-recorder $end\n")
+            f.write(f"$timescale 1 {timescale} $end\n")
+            f.write(f"$scope module dut $end\n")
+            for name, sig in pairs:
+                w = _bv_width(sig.value)
+                f.write(f"$var wire {max(1,w)} {VCD['ids'][sig]} {_vcd_safe_name(name)} $end\n")
+            f.write("$upscope $end\n")
+            f.write("$enddefinitions $end\n")
+
+            # Initial dump at start time
+            t0 = _scale_ps(t_start, timescale)
+            f.write("$dumpvars\n")
+            f.write(f"#{t0}\n")
+            for _, sig in pairs:
+                vid = VCD["ids"][sig]
+                f.write(start_vals[vid])
+            f.write("$end\n")
+
+            # Changes in (t_start, t_end]
+            current_time_scaled = None
+            for t_ps, vid, ch in VCD["events"]:
+                if vid not in selected_ids:
+                    continue
+                if t_ps <= t_start or t_ps > t_end:
+                    continue
+                ts = _scale_ps(t_ps, timescale)
+                if ts != current_time_scaled:
+                    f.write(f"#{ts}\n")
+                    current_time_scaled = ts
+                f.write(ch)
+
+        dut._log.info(f"[cocotb-dbg] VCD generated: {out_path}")
+
     # REPL environment: names injected into every snippet
     exec_globals = {
         # DUT + cocotb primitives
@@ -248,6 +509,11 @@ async def cocodbg(dut):
         # comparison helpers
         "as_uint": as_uint,
         "as_sint": as_sint,
+
+        # VCD control
+        "start_vcd": start_vcd,
+        "stop_vcd": stop_vcd,
+        "gen_vcd": gen_vcd,
     }
 
     # Compare DUT elements (unsigned for now)
@@ -347,6 +613,7 @@ async def cocodbg(dut):
         except Exception:
             return repr(val)
 
+    _ensure_vcd_monitors_initialized()
     cocotb.start_soon(executor_loop())
 
     # Keep the test alive WITHOUT advancing time (wait on an Event we never set)
