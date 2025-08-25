@@ -10,6 +10,8 @@ import subprocess
 from typing import Tuple
 import ast
 import readline
+import signal
+import re
 
 
 # =======================
@@ -284,6 +286,34 @@ def format_exception() -> str:
 HOST = "127.0.0.1"
 PORT = 9999
 
+# paths / pidfile helpers
+def _state_dir() -> str:
+    d = os.path.abspath("./.cocodbg")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _pidfile_path() -> str:
+    return os.path.join(_state_dir(), "sim.pid")
+
+def _write_pidfile(pid: int):
+    try:
+        with open(_pidfile_path(), "w") as f:
+            f.write(str(pid))
+    except Exception:
+        pass
+
+def _read_pidfile() -> int | None:
+    try:
+        with open(_pidfile_path(), "r") as f:
+            s = f.read().strip()
+        return int(s) if s else None
+    except Exception:
+        return None
+
+def _remove_pidfile():
+    with contextlib.suppress(Exception):
+        os.remove(_pidfile_path())
+
 def _tail_proc(proc: subprocess.Popen):
     """
     Continuously forward the simulation's stdout/stderr to our console.
@@ -300,110 +330,73 @@ def _tail_proc(proc: subprocess.Popen):
     t1.start(); t2.start()
     return (t1, t2)
 
-def _wait_for_port(host: str, port: int, timeout: float = 30.0) -> bool:
+def _can_connect(host: str, port: int, timeout: float = 0.5) -> bool:
+    with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+        s.settimeout(timeout)
+        return s.connect_ex((host, port)) == 0
+
+def _wait_for_port_open(host: str, port: int, timeout: float = 30.0) -> bool:
     """
     Poll a TCP port until it accepts connections.
     """
     end = time.time() + timeout
     while time.time() < end:
-        with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
-            s.settimeout(0.5)
-            if s.connect_ex((host, port)) == 0:
-                return True
+        if _can_connect(host, port):
+            return True
         time.sleep(0.25)
     return False
 
-def _client_loop():
-    print(f"Connecting to {HOST}:{PORT} ...")
-    with socket.create_connection((HOST, PORT)) as s, s.makefile("rwb", buffering=0) as f:
-        banner = f.readline().decode().rstrip()
-        print(banner)
-        print("# Auto-detect blocks: lines ending with ':' start a block; finish a block with a blank line. :quit to exit.")
-
-        _history_init()
-
-        buf: list[str] = []
-        indent_levels = 0
-
-        def _set_default_indent(level: int):
-            """Pre-fill the input line with indentation for a nicer UX."""
-            spaces = " " * (max(level, 0) * 4)
-
-            def hook():
-                try:
-                    readline.insert_text(spaces)
-                    readline.redisplay()
-                finally:
-                    readline.set_pre_input_hook(None)
-
-            try:
-                if sys.stdin.isatty():
-                    readline.set_pre_input_hook(hook)
-            except Exception:
-                pass
-
-        def _send_code_and_read_reply(code: str):
-            for ln in code.splitlines():
-                f.write(ln.encode() + b"\n")
-            f.write(b"\n")
-
-            # read framed reply
-            start = f.readline().decode().rstrip()
-            if start != "<<BEGIN>>":
-                print("# Protocol error (no BEGIN)")
-                return
-            payload_lines = []
-            while True:
-                ln = f.readline().decode().rstrip()
-                if ln == "<<END>>":
-                    break
-                payload_lines.append(ln)
-            print("\n".join(payload_lines))
-
-        while True:
-            prompt = ">>> " if not buf else "... "
-
-            if buf or indent_levels > 0:
-                _set_default_indent(indent_levels)
-            try:
-                line = input(prompt)
-            except EOFError:
-                line = ":quit"
-
-            if line.strip() == ":quit" or line.strip() == ":q":
-                f.write(b":quit\n")
-                break
-
-            if not buf and line.strip() == "":
-                continue
-
-            # SINGLE-LINE MODE
-            starts_block = line.rstrip().endswith(":")
-            if not buf and not starts_block:
-                _history_add_line(line)
-                _send_code_and_read_reply(line)
-                indent_levels = 0
-                continue
-
-            # BLOCK MODE
-            if line.strip() == "":
-                code = "\n".join(buf)
-                buf.clear()
-                _history_add_line(code)
-                _send_code_and_read_reply(code)
-                indent_levels = 0
-                continue
-            buf.append(line)
-
-            # Compute indentation for the next line:
-            stripped = line.lstrip(" ")
-            leading_spaces = len(line) - len(stripped)
-            current_level = max(leading_spaces // 4, 0)
-            indent_levels = current_level + (1 if stripped.endswith(":") else 0)
-
-def start_sim(sim_dir):
+def _wait_for_port_closed(host: str, port: int, timeout: float = 10.0) -> bool:
     """
-    Start the simulation and connect to the REPL server.
+    Poll a TCP port until it is closed (no listener).
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        if not _can_connect(host, port):
+            return True
+        time.sleep(0.2)
+    return not _can_connect(host, port)
+
+def _open_connection(host: str, port: int):
+    """
+    Open a TCP connection and return (socket, filelike). Reads and returns the banner.
+    """
+    s = socket.create_connection((host, port))
+    f = s.makefile("rwb", buffering=0)
+    banner = f.readline().decode().rstrip()
+    return s, f, banner
+
+def _kill_process_group_by_pid(pid: int):
+    """
+    Try to terminate/kill an entire process group given its leader PID.
+    """
+    if pid <= 0:
+        return
+    # TERM then KILL
+    with contextlib.suppress(Exception):
+        os.killpg(pid, signal.SIGTERM)
+    with contextlib.suppress(Exception):
+        os.kill(pid, signal.SIGTERM)
+    time.sleep(0.3) # little delay (should be enough)
+    with contextlib.suppress(Exception):
+        os.killpg(pid, signal.SIGKILL)
+    with contextlib.suppress(Exception):
+        os.kill(pid, signal.SIGKILL)
+
+def _preflight_cleanup():
+    """
+    Before launching a new sim, try to clean up any leftovers.
+    It kills by PID from pidfile (group-aware) and then waits for TCP port to be fully closed.
+    """
+    pid = _read_pidfile()
+    if pid:
+        _kill_process_group_by_pid(pid)
+        _remove_pidfile()
+    _wait_for_port_closed(HOST, PORT, timeout=5.0)
+
+def _launch_sim(sim_dir: str) -> tuple[subprocess.Popen, tuple[threading.Thread, threading.Thread]]:
+    """
+    Launch the HDL simulation via make and start tailing its output.
     """
     env = os.environ.copy()
     extra_py = os.path.abspath(".") + os.pathsep + os.path.abspath(sim_dir)
@@ -416,28 +409,255 @@ def start_sim(sim_dir):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=env,
+        start_new_session=True,  # POSIX: child is new process group leader
     )
-    _tail_proc(sim_proc)
+    _write_pidfile(sim_proc.pid)
+    tails = _tail_proc(sim_proc)
+    return sim_proc, tails
 
-    print(f"waiting for {HOST}:{PORT} ...")
-    if not _wait_for_port(HOST, PORT, timeout=60.0):
-        print("Error: debugger port did not open in time.")
-        with contextlib.suppress(Exception):
-            sim_proc.terminate()
-        sys.exit(1)
-
-    print("connected.\n")
+def _terminate_sim(sim_proc: subprocess.Popen):
+    """
+    Terminate the simulation process safely and wait for port to close.
+    Kills the entire process group to avoid straggler 'make', 'ghdl', etc.
+    """
+    print("shutting down simulation ...")
     try:
-        _client_loop()
-    finally:
-        print("shutting down simulation ...")
-        with contextlib.suppress(Exception):
-            sim_proc.terminate()
-        try:
-            sim_proc.wait(timeout=5)
-        except Exception:
+        if sim_proc.poll() is None:
             with contextlib.suppress(Exception):
-                sim_proc.kill()
+                os.killpg(sim_proc.pid, signal.SIGTERM)
+            with contextlib.suppress(Exception):
+                sim_proc.terminate()
+            try:
+                sim_proc.wait(timeout=5)
+            except Exception:
+                # Force kill
+                with contextlib.suppress(Exception):
+                    os.killpg(sim_proc.pid, signal.SIGKILL)
+                with contextlib.suppress(Exception):
+                    sim_proc.kill()
+                with contextlib.suppress(Exception):
+                    sim_proc.wait(timeout=3)
+    finally:
+        _wait_for_port_closed(HOST, PORT, timeout=10.0)
+        _remove_pidfile()
+
+def _client_loop(sim_dir: str):
+    """
+    Manage the whole interactive session, including restarts and step_back().
+    """
+    submissions: list[str] = []   # snippets that were actually sent to the server
+    last_connect_info = None      # (socket, file, banner)
+    sim_proc: subprocess.Popen | None = None
+
+    def _connect_new_sim():
+        nonlocal sim_proc, last_connect_info
+        _preflight_cleanup()
+
+        sim_proc, _ = _launch_sim(sim_dir)
+
+        print(f"waiting for {HOST}:{PORT} ...")
+        if not _wait_for_port_open(HOST, PORT, timeout=60.0):
+            print("Error: debugger port did not open in time.")
+            if sim_proc is not None:
+                _terminate_sim(sim_proc)
+            sys.exit(1)
+
+        s, f, banner = _open_connection(HOST, PORT)
+        last_connect_info = (s, f, banner)
+        print(banner)
+        print("# Auto-detect blocks: lines ending with ':' start a block; finish a block with a blank line. :quit to exit.")
+
+    def _close_conn_only():
+        nonlocal last_connect_info
+        if last_connect_info is None:
+            return
+        s, f, _ = last_connect_info
+        with contextlib.suppress(Exception):
+            f.write(b":quit\n")
+        with contextlib.suppress(Exception):
+            f.close()
+        with contextlib.suppress(Exception):
+            s.close()
+        last_connect_info = None
+
+    def _restart_and_reconnect():
+        """
+        Stop current sim (if any), ensure port closed, start fresh, and connect.
+        """
+        nonlocal sim_proc
+        if sim_proc is not None:
+            _terminate_sim(sim_proc)
+            sim_proc = None
+        # tiny backoff; some platforms release the port on next scheduler tick
+        time.sleep(0.05)
+        _connect_new_sim()
+
+    def _send_code_and_read_reply(code: str, *, print_reply: bool = True) -> str:
+        """
+        Send a snippet and read framed reply. Returns the raw payload (no BEGIN/END).
+        """
+        assert last_connect_info is not None
+        _, f, _ = last_connect_info
+        for ln in code.splitlines():
+            f.write(ln.encode() + b"\n")
+        f.write(b"\n")
+
+        start = f.readline().decode().rstrip()
+        if start != "<<BEGIN>>":
+            msg = "# Protocol error (no BEGIN)"
+            if print_reply:
+                print(msg)
+            return msg
+        payload_lines = []
+        while True:
+            ln = f.readline().decode().rstrip()
+            if ln == "<<END>>":
+                break
+            payload_lines.append(ln)
+        payload = "\n".join(payload_lines)
+        if print_reply:
+            print(payload)
+        return payload
+
+    def _replay_upto(count: int):
+        """
+        Replay the first 'count' submissions into a fresh simulation.
+        Suppresses normal OK output; prints errors if any occur.
+        """
+        nonlocal submissions
+        print(f"# [step_back] restarting and replaying {count} of {len(submissions)} submissions ...")
+
+        # drop existing connection and sim
+        _close_conn_only()
+        _restart_and_reconnect()
+
+        for i, code in enumerate(submissions[:count], 1):
+            payload = _send_code_and_read_reply(code, print_reply=False)
+            if payload.startswith("[ERROR]"):
+                print(f"# [replay {i}] ERROR while applying a past snippet:")
+                print(payload)
+
+        print("# [step_back] replay complete.")
+
+    print(f"Connecting to {HOST}:{PORT} ...")
+    _connect_new_sim()
+    _history_init()
+    
+    buf: list[str] = []
+    indent_levels = 0
+
+    re_stepback_call = re.compile(r"^\s*step_back\s*\(\s*(\d+)\s*\)\s*$")
+    re_colon_stepback = re.compile(r"^\s*:\s*(?:stepback|rewind)\s+(\d+)\s*$")
+
+    def _set_default_indent(level: int):
+        """Pre-fill the input line with indentation for a nicer UX."""
+        spaces = " " * (max(level, 0) * 4)
+
+        def hook():
+            try:
+                readline.insert_text(spaces)
+                readline.redisplay()
+            finally:
+                readline.set_pre_input_hook(None)
+
+        try:
+            if sys.stdin.isatty():
+                readline.set_pre_input_hook(hook)
+        except Exception:
+            pass
+
+    try:
+        while True:
+            prompt = ">>> " if not buf else "... "
+
+            if buf or indent_levels > 0:
+                _set_default_indent(indent_levels)
+            try:
+                line = input(prompt)
+            except EOFError:
+                line = ":quit"
+
+            # ':' commands (local) -----
+            m = re_colon_stepback.match(line)
+            if m and not buf:
+                n = int(m.group(1))
+                keep = max(0, len(submissions) - n)
+                _replay_upto(keep)
+                indent_levels = 0
+                continue
+
+            if line.strip() in (":quit", ":q"):
+                _close_conn_only()
+                if sim_proc is not None:
+                    _terminate_sim(sim_proc)
+                break
+
+            if not buf and line.strip() == "":
+                continue
+
+            # SINGLE-LINE MODE
+            starts_block = line.rstrip().endswith(":")
+            if not buf and not starts_block:
+                m = re_stepback_call.match(line)
+                if m:
+                    n = int(m.group(1))
+                    keep = max(0, len(submissions) - n)
+                    _replay_upto(keep)
+                    indent_levels = 0
+                    continue
+
+                _history_add_line(line)
+                payload = _send_code_and_read_reply(line)
+                submissions.append(line)
+                indent_levels = 0
+                continue
+
+            # BLOCK MODE
+            if line.strip() == "":
+                code = "\n".join(buf)
+                buf.clear()
+
+                m = re_stepback_call.match(code)
+                if m:
+                    n = int(m.group(1))
+                    keep = max(0, len(submissions) - n)
+                    _replay_upto(keep)
+                    indent_levels = 0
+                    continue
+
+                _history_add_line(code)
+                payload = _send_code_and_read_reply(code)
+                submissions.append(code)
+                indent_levels = 0
+                continue
+
+            buf.append(line)
+
+            # Compute indentation for the next line:
+            stripped = line.lstrip(" ")
+            leading_spaces = len(line) - len(stripped)
+            current_level = max(leading_spaces // 4, 0)
+            indent_levels = current_level + (1 if stripped.endswith(":") else 0)
+
+    except KeyboardInterrupt:
+        print("\n# Caught KeyboardInterrupt, cleaning up...")
+        _close_conn_only()
+        if sim_proc is not None:
+            _terminate_sim(sim_proc)
+        return
+
+def start_sim(sim_dir):
+    """
+    Start/drive the interactive client session.
+    """
+    try:
+        _client_loop(sim_dir)
+    finally:
+        pid = _read_pidfile()
+        if pid:
+            _kill_process_group_by_pid(pid)
+            _remove_pidfile()
+        _wait_for_port_closed(HOST, PORT, timeout=5.0)
 
 if __name__ == "__main__":
     start_sim("tests")
