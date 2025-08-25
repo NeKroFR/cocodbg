@@ -1,3 +1,6 @@
+################################################################################################
+### NEED TO FIX TIMINGS WITH THE REQL TIME VCD, CORRECT IN THE SIMULATION NOT IN THE VCD !!! ###
+################################################################################################
 import os
 import cocotb
 from cocotb.triggers import Timer, RisingEdge, FallingEdge, Event, Edge
@@ -13,6 +16,9 @@ import io
 import contextlib
 import inspect
 import operator
+import subprocess
+import fcntl
+
 
 DBG_HOST = "127.0.0.1"
 DBG_PORT = 9999
@@ -89,6 +95,8 @@ async def cocodbg(dut):
             CLK["task"].kill()
             CLK["task"] = None
         CLK["period_ns"] = p
+        # Snapshot (pre-action)
+        _snapshot_commit_now()
         CLK["task"] = cocotb.start_soon(Clock(dut.clk, p, units="ns").start())
 
     async def stop_clock(freeze: str = "low"):
@@ -96,6 +104,8 @@ async def cocodbg(dut):
         Stop the free-running clock (if running) and freeze level.
         freeze: "low" (default), "high", or "preserve"
         """
+        # Snapshot (pre-action)
+        _snapshot_commit_now()
         if CLK["task"] is not None:
             CLK["task"].kill()
             CLK["task"] = None
@@ -105,19 +115,27 @@ async def cocodbg(dut):
         elif freeze == "high":
             with contextlib.suppress(Exception):
                 dut.clk.value = 1
-        # "preserve" => leave current level
+        # Final snapshot (post-action)
+        _snapshot_commit_now()
 
     async def set_clock_rate(period_value, units: str = "ns"):
         """
         Set the default clock period used by run_for / cycles.
         Leaves the clock STOPPED (frozen low for determinism).
         """
+        # Snapshot (pre-action)
+        _snapshot_commit_now()
         await stop_clock(freeze="low")
         CLK["period_ns"] = _to_ns(period_value, units)
+        # Final snapshot (post-action)
+        _snapshot_commit_now()
 
     async def step():
         """Advance exactly one delta (no time advance)."""
+        # Snapshot at current point; then a delta; then snapshot again.
+        _snapshot_commit_now()
         await Timer(1, units="step")
+        _snapshot_commit_now()
 
     async def cycles(n: int, period_ns: float | None = None):
         """
@@ -126,23 +144,37 @@ async def cocodbg(dut):
         - period_ns defaults to CLK["period_ns"].
         - Uses integer picoseconds throughout, so it's drift-free.
         """
+        # Snapshot (pre-action)
+        _snapshot_commit_now()
+
         if CLK["task"] is not None:
             await stop_clock()
 
         p_ns = float(CLK["period_ns"] if period_ns is None else period_ns)
-        period_ps = int(round(p_ns * 1_000.0))  # 1 ns = 1000 ps
+        period_ps = int(round(p_ns * 1_000.0)) # 1 ns = 1000 ps
         half_ps = period_ps // 2
         first_half_ps = half_ps + (period_ps - 2 * half_ps)
         second_half_ps = half_ps
 
         with contextlib.suppress(Exception):
             dut.clk.value = 0
+        await Timer(1, units="step")
+        # Emit clk event now
+        _emit_single_signal_now(dut.clk)
 
         for _ in range(int(n)):
             await _await_time_ps(first_half_ps)
             dut.clk.value = 1
+            await Timer(1, units="step")
+            _emit_single_signal_now(dut.clk)
+
             await _await_time_ps(second_half_ps)
             dut.clk.value = 0
+            await Timer(1, units="step")
+            _emit_single_signal_now(dut.clk)
+
+        # Final snapshot (post-action)
+        _snapshot_commit_now()
 
     async def _temp_free_run_for_ps(total_ps: int, freeze: str = "preserve"):
         """
@@ -152,11 +184,14 @@ async def cocodbg(dut):
           - Guarantees NO rising edge if total_ps < half-period.
           - At the end, 'freeze' controls the final level: "preserve" | "low" | "high".
         """
+        # Snapshot (pre-action)
+        _snapshot_commit_now()
+
         if total_ps <= 0:
             return
 
         p_ns = float(CLK["period_ns"])
-        period_ps = int(round(p_ns * 1_000.0))  # 1 ns = 1000 ps
+        period_ps = int(round(p_ns * 1_000.0)) # 1 ns = 1000 ps
         half_ps = period_ps // 2
         first_half_ps = half_ps + (period_ps - 2 * half_ps)
         second_half_ps = half_ps
@@ -165,6 +200,8 @@ async def cocodbg(dut):
         lvl = 0
         with contextlib.suppress(Exception):
             dut.clk.value = lvl
+        await Timer(1, units="step")
+        _emit_single_signal_now(dut.clk)
 
         rem = int(total_ps)
         while rem > 0:
@@ -175,6 +212,8 @@ async def cocodbg(dut):
             await _await_time_ps(first_half_ps)
             lvl = 1
             dut.clk.value = lvl
+            await Timer(1, units="step")
+            _emit_single_signal_now(dut.clk)
             rem -= first_half_ps
 
             # second half, if we can't fit it, we stop high
@@ -184,6 +223,8 @@ async def cocodbg(dut):
             await _await_time_ps(second_half_ps)
             lvl = 0
             dut.clk.value = lvl
+            await Timer(1, units="step")
+            _emit_single_signal_now(dut.clk)
             rem -= second_half_ps
 
         # final freeze policy
@@ -200,10 +241,15 @@ async def cocodbg(dut):
           - Else: run a phase-safe temporary clock for exactly t, then freeze as requested.
         freeze: "preserve" (default), "low", or "high"
         """
+        # Snapshot (pre-action)
+        _snapshot_commit_now()
+
         total_ps = _to_total_ps(t, units)
 
         if CLK["task"] is not None:
             await _await_time_ps(total_ps)
+            # Final snapshot (post-action)
+            _snapshot_commit_now()
             return
 
         await _temp_free_run_for_ps(total_ps, freeze=freeze)
@@ -227,19 +273,28 @@ async def cocodbg(dut):
             return int(v.signed_integer)
         return int(v)
 
+    # -------- Minimal VCD / Live pipeline (commit-only at time-control calls) --------
     VCD = {
-        "pairs": [], # [(hier_name, handle)]
-        "ids": {}, # handle -> vcd_id
-        "events": [], # [(time_ps: int, vcd_id: str, change_line: str)]
-        "rec_active": True,
-        "mark_start_ps": None,
-        "mark_stop_ps":  None,
-        "selected_ids": None,
-    }
+        "pairs": [],          # [(hier_name, handle)]
+        "ids": {},            # handle -> vcd_id
+        "events": [],         # list[(time_ps, vid, change_line)]
+        "last": {},           # vid -> last change_line committed
+        "rec_active": False,
 
-    def _resolve_out_path(path: str) -> str:
-        base = os.environ.get("COCODBG_ROOT", os.getcwd())
-        return path if os.path.isabs(path) else os.path.join(base, path)
+        "live": {
+            "proc_shmidcat": None,
+            "proc_gtkwave": None,
+            "fd": None,
+            "outbuf": bytearray(),
+            "drain_task": None,
+            "timescale": "ns",
+            "drain_idx": 0,
+            "selected_ids": None,
+            "savefile": None,
+            "order_vids": None,
+        },
+    }
+    VCD_EVT = Event()
 
     def _collect_leaf_signals(root) -> list[tuple[str, ModifiableObject]]:
         """
@@ -304,6 +359,7 @@ async def cocodbg(dut):
         """
         charset = [chr(c) for c in range(33, 127)]
         counter = [0]
+
         def next_id():
             i = counter[0]
             s = ""
@@ -316,6 +372,7 @@ async def cocodbg(dut):
                     i //= base
             counter[0] += 1
             return s
+
         return next_id
 
     def _fmt_change(sig: ModifiableObject, vcd_id: str) -> str:
@@ -346,21 +403,10 @@ async def cocodbg(dut):
         if unit == "s":  return ps // 1_000_000_000_000
         raise ValueError(f"Unsupported timescale unit: {unit}")
 
-    async def _monitor_signal(sig: ModifiableObject, vcd_id: str):
-        """
-        Append (time_ps, id, change_line) on each edge if recording is active
-        """
-        while True:
-            await Edge(sig)
-            if not VCD["rec_active"]:
-                continue
-            t_ps = int(get_sim_time(units="ps"))
-            VCD["events"].append((t_ps, vcd_id, _fmt_change(sig, vcd_id)))
-
-    def _ensure_vcd_monitors_initialized():
+    def _ensure_vcd_initialized():
         """
         Ensure VCD monitors are initialized, if not initialize them.
-        """
+        """ 
         if VCD["pairs"]:
             return
         pairs = _collect_leaf_signals(dut)
@@ -369,87 +415,81 @@ async def cocodbg(dut):
         VCD["pairs"] = pairs
         VCD["ids"] = ids
 
+        # Seed "last" with current values (no events yet)
+        for _, sig in pairs:
+            VCD["last"][ids[sig]] = _fmt_change(sig, ids[sig])
+
+    def _emit_events(time_ps: int, vid_to_change: dict[str, str]):
+        if not vid_to_change:
+            return
+        order_vids = VCD["live"]["order_vids"] or [VCD["ids"][s] for _, s in VCD["pairs"]]
+        for vid in order_vids:
+            ch = vid_to_change.get(vid)
+            if ch is not None:
+                VCD["events"].append((time_ps, vid, ch))
+                VCD["last"][vid] = ch
+        with contextlib.suppress(Exception):
+            VCD_EVT.set()
+
+    def _snapshot_commit_now():
+        _ensure_vcd_initialized()
         t_ps = int(get_sim_time(units="ps"))
-        for _, sig in pairs:
-            change = _fmt_change(sig, ids[sig])
-            VCD["events"].append((t_ps, ids[sig], change))
+        changes = {}
+        for _, sig in VCD["pairs"]:
+            vid = VCD["ids"][sig]
+            ch = _fmt_change(sig, vid)
+            if VCD["last"].get(vid) != ch:
+                changes[vid] = ch
+        _emit_events(t_ps, changes)
 
-        for _, sig in pairs:
-            cocotb.start_soon(_monitor_signal(sig, ids[sig]))
+    def _emit_single_signal_now(sig: ModifiableObject):
+        _ensure_vcd_initialized()
+        t_ps = int(get_sim_time(units="ps"))
+        vid = VCD["ids"].get(sig)
+        if not vid:
+            return
+        ch = _fmt_change(sig, vid)
+        if VCD["last"].get(vid) != ch:
+            _emit_events(t_ps, {vid: ch})
 
-    async def start_vcd(signals: list[ModifiableObject] | None = None):
-        """
-        Start (or restart) a VCD recording window from NOW.
-        If 'signals' is provided, limit future gen_vcd() to those signals.
-        """
-        _ensure_vcd_monitors_initialized()
+    # -------- File VCD dump --------
+    async def start_vcd(signals=None):
+        _ensure_vcd_initialized()
         VCD["rec_active"] = True
-        VCD["mark_start_ps"] = int(get_sim_time(units="ps"))
-        VCD["mark_stop_ps"] = None
-        if signals is None:
-            VCD["selected_ids"] = None
-        else:
-            # map provided handles to existing ids; unknown handles are ignored
-            selected = set()
-            for s in signals:
-                vid = VCD["ids"].get(s)
-                if vid:
-                    selected.add(vid)
-            VCD["selected_ids"] = selected
 
     async def stop_vcd():
         """
         Stop recording (events after this call are not captured).
         Window end is marked at NOW.
         """
-        _ensure_vcd_monitors_initialized()
+        _ensure_vcd_initialized()
         VCD["rec_active"] = False
-        VCD["mark_stop_ps"] = int(get_sim_time(units="ps"))
+        _snapshot_commit_now()
+
+    def _resolve_out_path(path: str) -> str:
+        base = os.environ.get("COCODBG_ROOT", os.getcwd())
+        return path if os.path.isabs(path) else os.path.join(base, path)
 
     async def gen_vcd(path: str, *, timescale: str = "ns"):
-        """
-        Generate a VCD file.
-        ----
-        If `start_vcd()` was called the VCD will be from that moment to `stop_vcd()` (or NOW if it was not called).
-        Otherwise from the beginning (t=0) to NOW.
-        """
-        _ensure_vcd_monitors_initialized()
+        _ensure_vcd_initialized()
+        _snapshot_commit_now()
+
         out_path = _resolve_out_path(path)
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-        if VCD["mark_start_ps"] is not None:
-            t_start = VCD["mark_start_ps"]
-        else:
-            t_start = VCD["events"][0][0] if VCD["events"] else 0
-        t_end = VCD["mark_stop_ps"]
-        if t_end is None:
-            t_end = int(get_sim_time(units="ps"))
+        pairs = VCD["pairs"]
+        selected_ids = set(VCD["ids"][sig] for _, sig in pairs)
 
-        # Build signal list to dump
-        if VCD["selected_ids"] is None:
-            pairs = VCD["pairs"]
-            selected_ids = set(VCD["ids"][sig] for _, sig in pairs)
+        if VCD["events"]:
+            t_start = VCD["events"][0][0]
         else:
-            selected_ids = set(VCD["selected_ids"])
-            pairs = [(n, s) for (n, s) in VCD["pairs"] if VCD["ids"][s] in selected_ids]
+            t_start = int(get_sim_time(units="ps"))
 
-        # Precompute starting values at t_start
-        # Walk through events up to t_start and remember last value per id
         start_vals = {}
-        for t_ps, vid, ch in VCD["events"]:
-            if vid not in selected_ids:
-                continue
-            if t_ps > t_start:
-                break
-            start_vals[vid] = ch
-
-        # If any id lacks a prior event, synthesize from current value
         for _, sig in pairs:
             vid = VCD["ids"][sig]
-            if vid not in start_vals:
-                start_vals[vid] = _fmt_change(sig, vid)
+            start_vals[vid] = VCD["last"].get(vid, _fmt_change(sig, vid))
 
-        # Write the VCD
         with open(out_path, "w", buffering=1) as f:
             from datetime import datetime
             f.write(f"$date {datetime.now()} $end\n")
@@ -462,7 +502,6 @@ async def cocodbg(dut):
             f.write("$upscope $end\n")
             f.write("$enddefinitions $end\n")
 
-            # Initial dump at start time
             t0 = _scale_ps(t_start, timescale)
             f.write("$dumpvars\n")
             f.write(f"#{t0}\n")
@@ -471,22 +510,201 @@ async def cocodbg(dut):
                 f.write(start_vals[vid])
             f.write("$end\n")
 
-            # Changes in (t_start, t_end]
-            current_time_scaled = None
+            current_ts = None
             for t_ps, vid, ch in VCD["events"]:
                 if vid not in selected_ids:
                     continue
-                if t_ps <= t_start or t_ps > t_end:
-                    continue
                 ts = _scale_ps(t_ps, timescale)
-                if ts != current_time_scaled:
+                if ts != current_ts:
                     f.write(f"#{ts}\n")
-                    current_time_scaled = ts
+                    current_ts = ts
                 f.write(ch)
 
         dut._log.info(f"[cocotb-dbg] VCD generated: {out_path}")
 
-    # REPL environment: names injected into every snippet
+    # -------- Live GTKWave via shmidcat (commit-driven) --------
+    def _live_buf_append(txt: str):
+        VCD["live"]["outbuf"].extend(txt.encode("utf-8", "replace"))
+
+    def _live_try_flush():
+        fd = VCD["live"]["fd"]
+        if fd is None:
+            return
+        buf = VCD["live"]["outbuf"]
+        if not buf:
+            return
+        try:
+            n = os.write(fd, buf)  # type: ignore
+            if n > 0:
+                del buf[:n]
+        except (BlockingIOError, InterruptedError):
+            pass
+        except BrokenPipeError:
+            VCD["live"]["outbuf"].clear()
+            VCD["live"]["fd"] = None
+
+    def _live_write_header(pairs, timescale):
+        from datetime import datetime
+        _live_buf_append(f"$date {datetime.now()} $end\n")
+        _live_buf_append("$version cocotb-dbg live-follow $end\n")
+        _live_buf_append(f"$timescale 1 {timescale} $end\n")
+        _live_buf_append("$scope module dut $end\n")
+        for name, sig in pairs:
+            w = _bv_width(sig.value)
+            _live_buf_append(f"$var wire {max(1,w)} {VCD['ids'][sig]} {_vcd_safe_name(name)} $end\n")
+        _live_buf_append("$upscope $end\n")
+        _live_buf_append("$enddefinitions $end\n")
+
+    def _live_write_initial_dump(pairs, timescale):
+        t0_ps = int(get_sim_time(units="ps"))
+        t0 = _scale_ps(t0_ps, timescale)
+        _live_buf_append("$dumpvars\n")
+        _live_buf_append(f"#{t0}\n")
+        for _, sig in pairs:
+            _live_buf_append(_fmt_change(sig, VCD["ids"][sig]))
+        _live_buf_append("$end\n")
+
+    async def _live_drain_loop():
+        live = VCD["live"]
+        selected_ids = live["selected_ids"]
+        idx = live["drain_idx"]
+
+        while VCD["live"]["fd"] is not None:
+            await VCD_EVT.wait()
+            VCD_EVT.clear()
+
+            if (live["proc_shmidcat"] and live["proc_shmidcat"].poll() is not None) or \
+               (live["proc_gtkwave"] and live["proc_gtkwave"].poll() is not None):
+                VCD["live"]["fd"] = None
+                VCD["live"]["outbuf"].clear()
+                break
+
+            last_ts = None
+            while idx < len(VCD["events"]):
+                t_ps, vid, ch = VCD["events"][idx]
+                idx += 1
+                if selected_ids is not None and vid not in selected_ids:
+                    continue
+                ts = _scale_ps(t_ps, live["timescale"])
+                if ts != last_ts:
+                    _live_buf_append(f"#{ts}\n")
+                    last_ts = ts
+                _live_buf_append(ch)
+
+            live["drain_idx"] = idx
+            _live_try_flush()
+
+    async def gtkwave_live_start(
+        *,
+        signals=None,
+        timescale: str = "ns",
+        savefile: str | None = None,
+        gtkwave_path: str = "gtkwave",
+        shmidcat_path: str = "shmidcat",
+        kill_existing: bool = True,
+    ):
+        _ensure_vcd_initialized()
+
+        if kill_existing and VCD["live"]["fd"] is not None:
+            await gtkwave_live_stop(kill_viewer=True)
+
+        pairs = VCD["pairs"]
+        selected_ids = None
+        VCD["rec_active"] = True
+
+        try:
+            sh_proc = subprocess.Popen(
+                [shmidcat_path],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0
+            )
+        except FileNotFoundError:
+            dut._log.error("[cocotb-dbg] 'shmidcat' not found in PATH.")
+            return
+
+        fd = None
+        if sh_proc.stdin is not None:
+            try:
+                fd = sh_proc.stdin.fileno()
+                if fcntl is not None:
+                    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            except Exception:
+                pass
+
+        args = [gtkwave_path, "-v", "-I"]
+        if savefile:
+            args.append(_resolve_out_path(savefile))
+        try:
+            gw_proc = subprocess.Popen(
+                args,
+                stdin=sh_proc.stdout,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            dut._log.error("[cocotb-dbg] 'gtkwave' not found in PATH.")
+            with contextlib.suppress(Exception):
+                sh_proc.terminate()
+            return
+
+        initial_pairs = pairs
+        order_vids = [VCD["ids"][s] for _, s in initial_pairs]
+
+        VCD["live"].update({
+            "proc_shmidcat": sh_proc,
+            "proc_gtkwave": gw_proc,
+            "fd": fd,
+            "outbuf": bytearray(),
+            "drain_task": None,
+            "timescale": timescale,
+            "drain_idx": 0,
+            "selected_ids": selected_ids,
+            "savefile": savefile,
+            "order_vids": order_vids,
+        })
+
+        _live_write_header(initial_pairs, timescale)
+        _live_write_initial_dump(initial_pairs, timescale)
+        _live_try_flush()
+
+        VCD["live"]["drain_task"] = cocotb.start_soon(_live_drain_loop())
+        dut._log.info("[cocotb-dbg] GTKWave live streaming started (commit-only at time-control).")
+
+    async def gtkwave_live_stop(*, kill_viewer: bool = False):
+        _snapshot_commit_now()
+
+        live = VCD["live"]
+
+        task = live["drain_task"]
+        if task is not None:
+            with contextlib.suppress(Exception):
+                task.kill()
+        live["drain_task"] = None
+
+        _live_try_flush()
+        if live["proc_shmidcat"] is not None and live["proc_shmidcat"].stdin is not None:
+            with contextlib.suppress(Exception):
+                live["proc_shmidcat"].stdin.close()
+        live["fd"] = None
+        live["outbuf"].clear()
+
+        if live["proc_shmidcat"] is not None:
+            with contextlib.suppress(Exception):
+                live["proc_shmidcat"].terminate()
+        live["proc_shmidcat"] = None
+
+        if kill_viewer and live["proc_gtkwave"] is not None:
+            with contextlib.suppress(Exception):
+                live["proc_gtkwave"].terminate()
+        live["proc_gtkwave"] = None
+
+        VCD["rec_active"] = False
+        dut._log.info("[cocotb-dbg] GTKWave live streaming stopped.")
+
+    # -------- REPL env --------
     exec_globals = {
         # DUT + cocotb primitives
         "dut": dut,
@@ -514,10 +732,11 @@ async def cocodbg(dut):
         "start_vcd": start_vcd,
         "stop_vcd": stop_vcd,
         "gen_vcd": gen_vcd,
+
+        "gtkwave_live_start": gtkwave_live_start,
+        "gtkwave_live_stop": gtkwave_live_stop,
     }
 
-    # Compare DUT elements (unsigned for now)
-    # TODO: Add signed comparison
     def _cmpwrap(op):
         def _impl(self, other):
             try:
@@ -525,6 +744,7 @@ async def cocodbg(dut):
             except Exception:
                 return NotImplemented
         return _impl
+
     for _cls in (c for c in (BinaryValue, ModifiableObject) if c is not None):
         _cls.__lt__ = _cmpwrap(operator.lt)
         _cls.__le__ = _cmpwrap(operator.le)
@@ -537,14 +757,10 @@ async def cocodbg(dut):
             _cls.__ne__ = _cmpwrap(operator.ne)
 
     async def executor_loop():
-        """
-        Process commands and run them inside the simulation.
-        """
         while True:
             try:
                 code, reply_q, addr = dbg.cmd_q.get_nowait()
             except queue.Empty:
-                # Idle: a single delta keeps the loop responsive without moving time.
                 await Timer(1, units="step")
                 continue
             code = format_user_input(code)
@@ -561,6 +777,10 @@ async def cocodbg(dut):
                 if inspect.isawaitable(result):
                     result = await result
 
+                # settle a couple of deltas for assignment effects (no VCD write here)
+                await Timer(1, units="step")
+                await Timer(1, units="step")
+
                 printed = out.getvalue()
                 if printed:
                     payload = ["[OK]", "## stdout:", printed.rstrip("\n"), "## return:", _fmt_result(result)]
@@ -569,6 +789,9 @@ async def cocodbg(dut):
                 msg = "\n".join(payload)
 
             except Exception:
+                with contextlib.suppress(Exception):
+                    await Timer(1, units="step")
+                    await Timer(1, units="step")
                 printed = out.getvalue()
                 if printed:
                     payload = ["[ERROR]", "## stdout (partial):", printed.rstrip("\n"), "## traceback:", format_exception().rstrip("\n")]
@@ -613,7 +836,8 @@ async def cocodbg(dut):
         except Exception:
             return repr(val)
 
-    _ensure_vcd_monitors_initialized()
+    # Initialize VCD catalog immediately (no events yet)
+    _ensure_vcd_initialized()
     cocotb.start_soon(executor_loop())
 
     # Keep the test alive WITHOUT advancing time (wait on an Event we never set)
