@@ -522,6 +522,33 @@ async def cocodbg(dut):
 
         dut._log.info(f"[cocotb-dbg] VCD generated: {out_path}")
 
+    def view_vcd(path: str, *, gtkwave_path: str = "gtkwave") -> subprocess.Popen | None:
+        """
+        Open a VCD file in GTKWave.
+        Returns the Popen handle on success, or None on failure.
+        """
+        out_path = _resolve_out_path(path)
+        if not os.path.exists(out_path):
+            dut._log.error(f"[cocotb-dbg] VCD not found: {out_path}")
+            return None
+
+        try:
+            proc = subprocess.Popen(
+                [gtkwave_path, out_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            dut._log.info(f"[cocotb-dbg] Opening VCD in GTKWave: {out_path}")
+            return proc
+        except FileNotFoundError:
+            dut._log.error("[cocotb-dbg] 'gtkwave' not found in PATH.")
+            return None
+        except Exception as e:
+            dut._log.error(f"[cocotb-dbg] Failed to launch GTKWave: {e}")
+        return None
+
+
+
     # -------- Live GTKWave via shmidcat (commit-driven) --------
     def _live_buf_append(txt: str):
         VCD["live"]["outbuf"].extend(txt.encode("utf-8", "replace"))
@@ -732,6 +759,7 @@ async def cocodbg(dut):
         "start_vcd": start_vcd,
         "stop_vcd": stop_vcd,
         "gen_vcd": gen_vcd,
+        "view_vcd": view_vcd,
 
         "gtkwave_live_start": gtkwave_live_start,
         "gtkwave_live_stop": gtkwave_live_stop,
