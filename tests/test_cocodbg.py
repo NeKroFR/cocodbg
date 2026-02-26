@@ -1,6 +1,3 @@
-################################################################################################
-### NEED TO FIX TIMINGS WITH THE REQL TIME VCD, CORRECT IN THE SIMULATION NOT IN THE VCD !!! ###
-################################################################################################
 import os
 import cocotb
 from cocotb.triggers import Timer, RisingEdge, FallingEdge, Event, Edge
@@ -18,7 +15,7 @@ import inspect
 import operator
 import subprocess
 import fcntl
-
+from typing import Any, Awaitable, Callable
 
 DBG_HOST = "127.0.0.1"
 DBG_PORT = 9999
@@ -83,6 +80,8 @@ async def cocodbg(dut):
                              ("ps",                1)):
             count, ps = divmod(ps, factor)
             if count:
+                if dbg.cancel_evt.is_set():
+                    return
                 await Timer(int(count), units=unit)
 
     async def start_clock(period_ns: float | None = None):
@@ -95,7 +94,6 @@ async def cocodbg(dut):
             CLK["task"].kill()
             CLK["task"] = None
         CLK["period_ns"] = p
-        # Snapshot (pre-action)
         _snapshot_commit_now()
         CLK["task"] = cocotb.start_soon(Clock(dut.clk, p, units="ns").start())
 
@@ -104,7 +102,6 @@ async def cocodbg(dut):
         Stop the free-running clock (if running) and freeze level.
         freeze: "low" (default), "high", or "preserve"
         """
-        # Snapshot (pre-action)
         _snapshot_commit_now()
         if CLK["task"] is not None:
             CLK["task"].kill()
@@ -115,7 +112,6 @@ async def cocodbg(dut):
         elif freeze == "high":
             with contextlib.suppress(Exception):
                 dut.clk.value = 1
-        # Final snapshot (post-action)
         _snapshot_commit_now()
 
     async def set_clock_rate(period_value, units: str = "ns"):
@@ -123,16 +119,13 @@ async def cocodbg(dut):
         Set the default clock period used by run_for / cycles.
         Leaves the clock STOPPED (frozen low for determinism).
         """
-        # Snapshot (pre-action)
         _snapshot_commit_now()
         await stop_clock(freeze="low")
         CLK["period_ns"] = _to_ns(period_value, units)
-        # Final snapshot (post-action)
         _snapshot_commit_now()
 
     async def step():
         """Advance exactly one delta (no time advance)."""
-        # Snapshot at current point; then a delta; then snapshot again.
         _snapshot_commit_now()
         await Timer(1, units="step")
         _snapshot_commit_now()
@@ -144,7 +137,6 @@ async def cocodbg(dut):
         - period_ns defaults to CLK["period_ns"].
         - Uses integer picoseconds throughout, so it's drift-free.
         """
-        # Snapshot (pre-action)
         _snapshot_commit_now()
 
         if CLK["task"] is not None:
@@ -163,6 +155,8 @@ async def cocodbg(dut):
         _emit_single_signal_now(dut.clk)
 
         for _ in range(int(n)):
+            if dbg.cancel_evt.is_set():
+                break
             await _await_time_ps(first_half_ps)
             dut.clk.value = 1
             await Timer(1, units="step")
@@ -173,7 +167,6 @@ async def cocodbg(dut):
             await Timer(1, units="step")
             _emit_single_signal_now(dut.clk)
 
-        # Final snapshot (post-action)
         _snapshot_commit_now()
 
     async def _temp_free_run_for_ps(total_ps: int, freeze: str = "preserve"):
@@ -184,7 +177,6 @@ async def cocodbg(dut):
           - Guarantees NO rising edge if total_ps < half-period.
           - At the end, 'freeze' controls the final level: "preserve" | "low" | "high".
         """
-        # Snapshot (pre-action)
         _snapshot_commit_now()
 
         if total_ps <= 0:
@@ -205,6 +197,8 @@ async def cocodbg(dut):
 
         rem = int(total_ps)
         while rem > 0:
+            if dbg.cancel_evt.is_set():
+                return
             # first half, no rising edge if we can't fit it
             if rem < first_half_ps:
                 await _await_time_ps(rem)
@@ -232,7 +226,6 @@ async def cocodbg(dut):
             dut.clk.value = 0 # may create a zero-time falling edge
         elif freeze == "high" and lvl != 1:
             dut.clk.value = 1 # may create a zero-time rising edge
-        # "preserve" => do nothing
 
     async def run_for(t, units: str = "ns", freeze: str = "preserve"):
         """
@@ -241,37 +234,76 @@ async def cocodbg(dut):
           - Else: run a phase-safe temporary clock for exactly t, then freeze as requested.
         freeze: "preserve" (default), "low", or "high"
         """
-        # Snapshot (pre-action)
         _snapshot_commit_now()
 
         total_ps = _to_total_ps(t, units)
 
         if CLK["task"] is not None:
             await _await_time_ps(total_ps)
-            # Final snapshot (post-action)
             _snapshot_commit_now()
             return
 
         await _temp_free_run_for_ps(total_ps, freeze=freeze)
 
     ### Comparison helpers + auto-coercing comparisons ###
+    def _bits_to_int(binstr: str, *, signed: bool = False) -> int:
+        """
+        Convert a cocotb BinaryValue.binstr (may contain UXZWH-) to int by
+        substituting non-binary chars with '0'. If signed=True, interpret two's
+        complement using the resulting bit width.
+        """
+        if not isinstance(binstr, str) or not binstr:
+            return 0
+        # normalize and substitute unknowns
+        s = "".join(ch if ch in ("0", "1") else "0" for ch in binstr.lower())
+        n = int(s, 2)
+        if signed and s[0] == "1":
+            n -= 1 << len(s)
+        return n
+
     def as_uint(x):
         """
-        Unsigned int view of a cocotb handle or BinaryValue (raises on X/Z).
+        Unsigned int view of a cocotb handle or BinaryValue.
+        Resolves X/Z/U/W/H/- by substituting 0 (no exception).
         """
         v = getattr(x, "value", x)
-        if hasattr(v, "integer"):
-            return int(v.integer)
-        return int(v)
+        # Fast path when cocotb can already resolve
+        try:
+            if hasattr(v, "integer"):
+                return int(v.integer)
+        except Exception:
+            pass
+        # Fallbacks
+        try:
+            return int(v)  # if v is already a python int-like
+        except Exception:
+            pass
+        try:
+            return _bits_to_int(v.binstr, signed=False)
+        except Exception:
+            # last resort: string-ify and strip non-bits
+            return _bits_to_int(str(v), signed=False)
 
     def as_sint(x):
         """
-        Signed int view (uses BinaryValue.signed_integer if available).
+        Signed int view (two's complement). Unknowns resolved to 0.
         """
         v = getattr(x, "value", x)
-        if hasattr(v, "signed_integer"):
-            return int(v.signed_integer)
-        return int(v)
+        # If BinaryValue has signed_integer and it's resolvable, use it
+        try:
+            if hasattr(v, "signed_integer"):
+                return int(v.signed_integer)
+        except Exception:
+            pass
+        # Fallbacks
+        try:
+            return int(v)  # if already a python int-like
+        except Exception:
+            pass
+        try:
+            return _bits_to_int(v.binstr, signed=True)
+        except Exception:
+            return _bits_to_int(str(v), signed=True)
 
     # -------- Minimal VCD / Live pipeline (commit-only at time-control calls) --------
     VCD = {
@@ -506,8 +538,7 @@ async def cocodbg(dut):
             f.write("$dumpvars\n")
             f.write(f"#{t0}\n")
             for _, sig in pairs:
-                vid = VCD["ids"][sig]
-                f.write(start_vals[vid])
+                f.write(start_vals[VCD["ids"][sig]])
             f.write("$end\n")
 
             current_ts = None
@@ -631,6 +662,7 @@ async def cocodbg(dut):
         kill_existing: bool = True,
     ):
         _ensure_vcd_initialized()
+        _snapshot_commit_now()  # sync VCD["last"] before writing initial dump
 
         if kill_existing and VCD["live"]["fd"] is not None:
             await gtkwave_live_stop(kill_viewer=True)
@@ -687,7 +719,7 @@ async def cocodbg(dut):
             "outbuf": bytearray(),
             "drain_task": None,
             "timescale": timescale,
-            "drain_idx": 0,
+            "drain_idx": len(VCD["events"]),
             "selected_ids": selected_ids,
             "savefile": savefile,
             "order_vids": order_vids,
@@ -731,6 +763,260 @@ async def cocodbg(dut):
         VCD["rec_active"] = False
         dut._log.info("[cocotb-dbg] GTKWave live streaming stopped.")
 
+
+    def _resolve_handle(path: str):
+        """
+        Resolve a 'dut.foo.bar' style path to a cocotb handle.
+        If 'path' is already a handle, return it as-is.
+        """
+        if not isinstance(path, str):
+            return path
+        obj = dut
+        parts = path.split(".")
+        if parts and parts[0] == "dut":
+            parts = parts[1:]
+        for p in parts:
+            if not p:
+                continue
+            obj = getattr(obj, p)
+        return obj
+
+    def _bitpat_match(bin_value: str, pattern: str) -> bool:
+        """
+        Compare a binary string to a pattern with don't-cares (x/z).
+        Lengths are normalized by left-padding the shorter with zeros.
+        """
+        b = bin_value.lower()
+        p = pattern.lower()
+        if len(b) < len(p):
+            b = b.rjust(len(p), "0")
+        elif len(p) < len(b):
+            p = p.rjust(len(b), "0")
+        for ch_val, ch_pat in zip(b, p):
+            if ch_pat in ("x", "z"):
+                continue
+            if ch_val != ch_pat:
+                return False
+        return True
+
+    async def _maybe_await(x):
+        if inspect.isawaitable(x):
+            return await x
+        return x
+
+
+    def _compile_update_snippet(snippet: str) -> Callable[[], Awaitable[Any]]:
+        """
+        Compile a string snippet into an async callable using the same wrapper
+        used by the REPL so that 'await' is allowed inside.
+        """
+        wrapper = wrap_code_as_async(snippet)
+        locs: dict[str, Any] = {}
+        # Use the REPL globals so user variables persist across calls
+        exec(wrapper, exec_globals, locs)
+        async def _runner():
+            res = locs["__user_main__"]()
+            return await _maybe_await(res)
+        return _runner
+
+    async def _advance_once(granularity, clk_handle):
+        """
+        Advance time by one unit according to granularity.
+        Returns the number of *cycles* consumed (0/1) for accounting.
+        """
+        if granularity == "delta":
+            await step()
+            return 0
+
+        if isinstance(granularity, tuple) and len(granularity) == 3 and granularity[0] == "time":
+            _, val, units = granularity
+            await run_for(val, units, freeze="preserve")
+            return 0
+
+        if granularity == "edge":
+            clkh = clk_handle or getattr(dut, "clk", None)
+            if clkh is None:
+                # Fallback to half-period manual toggle
+                half_ps = int(round(float(CLK["period_ns"]) * 1_000.0 / 2.0))
+                await _temp_free_run_for_ps(half_ps, freeze="preserve")
+                return 0
+            await RisingEdge(clkh)
+            return 0
+
+        # default: "cycle"
+        if CLK["task"] is not None:
+            clkx = clk_handle or getattr(dut, "clk", None)
+            if clkx is None:
+                await _temp_free_run_for_ps(int(round(float(CLK["period_ns"]) * 1_000.0)), freeze="preserve")
+                return 1
+            await RisingEdge(clkx)
+            await FallingEdge(clkx)
+            return 1
+
+        await cycles(1)
+        return 1
+
+    async def _eval_state_spec_one(spec) -> bool:
+        """
+        Evaluate a single state specification:
+        - callable -> truthy
+        - dict -> all pairs match (value, pattern or masked)
+        """
+        if callable(spec):
+            val = spec()
+            return bool(await _maybe_await(val))
+
+        if isinstance(spec, dict):
+            for k, want in spec.items():
+                sig = _resolve_handle(k)
+                if isinstance(want, tuple) and len(want) == 3 and str(want[1]).lower() == "mask":
+                    val = as_uint(sig)
+                    masked = val & int(want[2])
+                    if masked != (int(want[0]) & int(want[2])):
+                        return False
+                elif isinstance(want, str):
+                    try:
+                        binstr = sig.value.binstr
+                    except Exception:
+                        binstr = format(as_uint(sig), "b")
+                    if not _bitpat_match(binstr, want):
+                        return False
+                else:
+                    if as_uint(sig) != int(want):
+                        return False
+            return True
+
+        raise TypeError(f"Unsupported state spec type: {type(spec)!r}")
+
+    async def _eval_states(states, mode: str) -> tuple[bool, int | None]:
+        """
+        Evaluate one or many states according to mode='any'/'all'.
+        Returns (matched, which_index_or_None).
+        """
+        if isinstance(states, (list, tuple)):
+            if mode == "all":
+                for st in states:
+                    ok = await _eval_state_spec_one(st)
+                    if not ok:
+                        return False, None
+                return True, None
+            else:
+                for i, st in enumerate(states):
+                    ok = await _eval_state_spec_one(st)
+                    if ok:
+                        return True, i
+                return False, None
+        else:
+            ok = await _eval_state_spec_one(states)
+            return bool(ok), (0 if ok else None)
+
+    async def wait_until(
+        states,
+        update=None,
+        *,
+        mode: str = "any",
+        granularity: object = "cycle",
+        clk=None,
+        timeout: tuple[object, str] | None = None,
+        max_cycles: int | None = None,
+        max_iters: int | None = None,
+    ):
+        """
+        Wait until 'states' is satisfied. Optionally run 'update' each iteration.
+        Ctrl-C on the client sends ':cancel' which sets dbg.cancel_evt; we detect it here and exit cleanly.
+        """
+        if isinstance(update, str):
+            update_fn = _compile_update_snippet(update)
+        elif update is None:
+            update_fn = None
+        elif callable(update):
+            if inspect.iscoroutinefunction(update):
+                async def _afn():
+                    return await update()
+                update_fn = _afn
+            else:
+                async def _sfn():
+                    return update()
+                update_fn = _sfn
+        else:
+            raise TypeError("update must be None, a callable, or a string snippet")
+
+        with contextlib.suppress(Exception):
+            dbg.cancel_evt.clear()
+
+        deadline_ps = None
+        if timeout is not None:
+            tval, tunits = timeout
+            deadline_ps = int(get_sim_time(units="ps")) + _to_total_ps(tval, tunits)
+
+        iter_count = 0
+        cycle_count = 0
+
+        matched, which = await _eval_states(states, mode)
+        if matched:
+            return {
+                "hit": True,
+                "which": which,
+                "iters": iter_count,
+                "cycles": cycle_count,
+                "time_ps": int(get_sim_time(units="ps")),
+            }
+
+        while True:
+            if getattr(dbg, "cancel_evt", None) is not None and dbg.cancel_evt.is_set():
+                dbg.cancel_evt.clear()
+                return {
+                    "hit": False,
+                    "which": None,
+                    "iters": iter_count,
+                    "cycles": cycle_count,
+                    "time_ps": int(get_sim_time(units="ps")),
+                    "cancelled": True,
+                }
+
+            iter_count += 1
+            if max_iters is not None and iter_count > max_iters:
+                return {
+                    "hit": False,
+                    "which": None,
+                    "iters": iter_count - 1,
+                    "cycles": cycle_count,
+                    "time_ps": int(get_sim_time(units="ps")),
+                }
+
+            cycle_count += await _advance_once(granularity, clk)
+
+            if update_fn is not None:
+                await update_fn()
+
+            matched, which = await _eval_states(states, mode)
+            if matched:
+                return {
+                    "hit": True,
+                    "which": which,
+                    "iters": iter_count,
+                    "cycles": cycle_count,
+                    "time_ps": int(get_sim_time(units="ps")),
+                }
+
+            # Limits
+            if max_cycles is not None and cycle_count >= max_cycles:
+                return {
+                    "hit": False,
+                    "which": None,
+                    "iters": iter_count,
+                    "cycles": cycle_count,
+                    "time_ps": int(get_sim_time(units="ps")),
+                }
+            if deadline_ps is not None and int(get_sim_time(units="ps")) >= deadline_ps:
+                return {
+                    "hit": False,
+                    "which": None,
+                    "iters": iter_count,
+                    "cycles": cycle_count,
+                    "time_ps": int(get_sim_time(units="ps")),
+                }
+
     # -------- REPL env --------
     exec_globals = {
         # DUT + cocotb primitives
@@ -763,6 +1049,9 @@ async def cocodbg(dut):
 
         "gtkwave_live_start": gtkwave_live_start,
         "gtkwave_live_stop": gtkwave_live_stop,
+
+        # wait-until features
+        "wait_until": wait_until,
     }
 
     def _cmpwrap(op):
@@ -797,6 +1086,8 @@ async def cocodbg(dut):
             out = io.StringIO()
             try:
                 exec(wrapper, exec_globals, exec_locals)
+                with contextlib.suppress(Exception):
+                    dbg.cancel_evt.clear()
                 coro = exec_locals["__user_main__"]()
                 with contextlib.redirect_stdout(out):
                     result = await coro

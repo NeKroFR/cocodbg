@@ -12,6 +12,7 @@ import ast
 import readline
 import signal
 import re
+import select
 
 
 # =======================
@@ -33,6 +34,7 @@ class CocotbDebugger:
         self._srv_thread = None
         self._stop_evt = threading.Event()
         self.cmd_q: "queue.Queue[Command]" = queue.Queue()
+        self.cancel_evt = threading.Event()
 
     def start(self):
         if self._srv_thread and self._srv_thread.is_alive():
@@ -77,12 +79,34 @@ class CocotbDebugger:
                 line = line.rstrip(b"\r\n")
                 if line == b":quit":
                     break
+                if line == b":cancel":
+                    self.cancel_evt.set()
+                    with contextlib.suppress(Exception):
+                        self._send_line(conn_file, b"# cancel requested")
+                    continue
+
                 if line == b"":  # blank line => submit accumulated buffer
                     code = b"\n".join(buf).decode("utf-8", "replace")
                     buf.clear()
                     reply_q: "queue.Queue[str]" = queue.Queue()
                     self.cmd_q.put((code, reply_q, addr))
-                    reply = reply_q.get()  # wait for executor to respond
+                    reply = None
+                    while reply is None:
+                        try:
+                            reply = reply_q.get(timeout=0.05)
+                        except queue.Empty:
+                            with contextlib.suppress(Exception):
+                                r, _, _ = select.select([conn], [], [], 0)
+                                if r:
+                                    chunk = conn.recv(4096, socket.MSG_PEEK)
+                                    if not chunk or b":cancel" in chunk:
+                                        if chunk and b":cancel" in chunk:
+                                            conn_file.readline()
+                                            with contextlib.suppress(Exception):
+                                                self._send_line(conn_file, b"# cancel requested")
+                                        self.cancel_evt.set()
+                    if reply is None:
+                        break
 
                     # frame the reply
                     try:
@@ -99,6 +123,7 @@ class CocotbDebugger:
                 conn_file.close()
                 conn.close()
 
+        
     @staticmethod
     def _send_line(f, data: bytes):
         try:
@@ -243,30 +268,69 @@ def _assigned_at_toplevel(tree: ast.Module) -> set[str]:
 def wrap_code_as_async(code: str) -> str:
     """
     Wrap arbitrary user code into an async function __user_main__().
-    - If the last statement is an expression (incl. `await ...`), return it so the REPL shows its value.
-    - Empty lines become 'pass' to keep indentation valid.
+    - If the last statement is an expression, return it so the REPL shows its value.
+    - Empty/comments/docstring-only bodies -> 'pass'.
     - Names assigned at the user's top level are declared 'global' so values persist.
     """
+    def _assigned_at_toplevel_safe(src: str) -> set[str]:
+        try:
+            tree = ast.parse(src, mode="exec")
+            return _assigned_at_toplevel(tree)
+        except Exception:
+            return set()
+
+    def _is_only_comments_or_blank(src: str) -> bool:
+        for ln in src.splitlines():
+            s = ln.strip()
+            if not s or s.startswith("#"):
+                continue
+            return False
+        return True
+
+    def _is_only_docstrings(src: str) -> bool:
+        # True if the module body contains only Expr(Constant(str)) nodes (docstrings)
+        try:
+            tree = ast.parse(src, mode="exec")
+        except Exception:
+            return False
+        if not tree.body:
+            return False
+        for node in tree.body:
+            if not (isinstance(node, ast.Expr) and isinstance(getattr(node, "value", None), ast.Constant)
+                    and isinstance(node.value.value, str)):
+                return False
+        return True
+
     globals_line = ""
+    assigned = sorted(_assigned_at_toplevel_safe(code))
+    if assigned:
+        globals_line = "    global " + ", ".join(assigned) + "\n"
+
+    # If input is only comments/blank or pure docstrings: body is 'pass'
+    if _is_only_comments_or_blank(code) or _is_only_docstrings(code):
+        body = (globals_line + "    pass") if globals_line else "    pass"
+        return f"async def __user_main__():\n{body}\n"
+
+    # Try to auto-return the last expression
     try:
         tree = ast.parse(code, mode="exec")
-        assigned = sorted(_assigned_at_toplevel(tree))
-        if assigned:
-            globals_line = "    global " + ", ".join(assigned) + "\n"
-        if tree.body:
+        if tree.body and isinstance(tree.body[-1], ast.Expr) and hasattr(tree.body[-1], "lineno"):
             last = tree.body[-1]
-            if isinstance(last, ast.Expr) and hasattr(last, "lineno"):
-                lines = code.splitlines()
-                start = last.lineno - 1
-                end = getattr(last, "end_lineno", last.lineno) - 1
-                expr_src = ast.get_source_segment(code, last.value)
-                if not expr_src:
-                    expr_src = "\n".join(lines[start:end + 1]).strip()
-                kept = lines[:start] + lines[end + 1:]
+            lines = code.splitlines()
+            start = last.lineno - 1
+            end = getattr(last, "end_lineno", last.lineno) - 1
+            expr_src = ast.get_source_segment(code, last.value)
+            if not expr_src:
+                expr_src = "\n".join(lines[start:end + 1]).strip()
+            kept = lines[:start] + lines[end + 1:]
+            # If kept part is only comments/blank/docstrings, ensure at least one 'pass'
+            kept_src = "\n".join(kept)
+            if _is_only_comments_or_blank(kept_src) or _is_only_docstrings(kept_src):
+                indented = ["    pass"]
+            else:
                 indented = [("    " + ln) if ln.strip() else "    pass" for ln in kept]
-                body = globals_line + ("\n".join(indented) + ("\n" if indented else "")) + f"    return ({expr_src})"
-                return f"async def __user_main__():\n{body}\n"
-
+            body = globals_line + ("\n".join(indented) + ("\n" if indented else "")) + f"    return ({expr_src})"
+            return f"async def __user_main__():\n{body}\n"
     except Exception:
         pass
 
@@ -444,8 +508,12 @@ def _terminate_sim(sim_proc: subprocess.Popen):
 def _client_loop(sim_dir: str):
     """
     Manage the whole interactive session, including restarts and step_back().
+    Groups user input into one snippet when:
+      - A block starts with ':' and ends on blank line (original behavior), OR
+      - Parentheses/brackets/braces are open across lines, OR
+      - Inside a triple-quoted string ('''...''' or \"\"\"...\"\"\").
     """
-    submissions: list[str] = []   # snippets that were actually sent to the server
+    submissions: list[str] = []   # snippets actually sent to the server
     last_connect_info = None      # (socket, file, banner)
     sim_proc: subprocess.Popen | None = None
 
@@ -465,7 +533,8 @@ def _client_loop(sim_dir: str):
         s, f, banner = _open_connection(HOST, PORT)
         last_connect_info = (s, f, banner)
         print(banner)
-        print("# Auto-detect blocks: lines ending with ':' start a block; finish a block with a blank line. :quit to exit.")
+        print("# Auto-detect blocks: lines ending with ':' start a block; finish with a blank line.")
+        print("# Multi-line calls with (), [], {} are grouped automatically; they send when brackets balance. :quit to exit.")
 
     def _close_conn_only():
         nonlocal last_connect_info
@@ -481,95 +550,146 @@ def _client_loop(sim_dir: str):
         last_connect_info = None
 
     def _restart_and_reconnect():
-        """
-        Stop current sim (if any), ensure port closed, start fresh, and connect.
-        """
         nonlocal sim_proc
         if sim_proc is not None:
             _terminate_sim(sim_proc)
             sim_proc = None
-        # tiny backoff; some platforms release the port on next scheduler tick
         time.sleep(0.05)
         _connect_new_sim()
 
     def _send_code_and_read_reply(code: str, *, print_reply: bool = True) -> str:
-        """
-        Send a snippet and read framed reply. Returns the raw payload (no BEGIN/END).
-        """
+        nonlocal last_connect_info
         assert last_connect_info is not None
-        _, f, _ = last_connect_info
+        s, f, _ = last_connect_info
         for ln in code.splitlines():
             f.write(ln.encode() + b"\n")
         f.write(b"\n")
 
-        start = f.readline().decode().rstrip()
+        try:
+            start = f.readline().decode().rstrip()
+        except KeyboardInterrupt:
+            with contextlib.suppress(Exception):
+                f.write(b":cancel\n"); f.flush()
+            print("# ^C: cancel requested; reconnecting to debugger without stopping the simulation...")
+            _close_conn_only()
+            s2, f2, banner2 = _open_connection(HOST, PORT)
+            last_connect_info = (s2, f2, banner2)
+            print(banner2)
+            return "[OK] # cancelled by user"
+
         if start != "<<BEGIN>>":
             msg = "# Protocol error (no BEGIN)"
-            if print_reply:
-                print(msg)
+            if print_reply: print(msg)
             return msg
+
         payload_lines = []
         while True:
-            ln = f.readline().decode().rstrip()
-            if ln == "<<END>>":
-                break
+            try:
+                ln = f.readline().decode().rstrip()
+            except KeyboardInterrupt:
+                with contextlib.suppress(Exception):
+                    f.write(b":cancel\n"); f.flush()
+                print("# ^C: cancel requested; reconnecting to debugger without stopping the simulation...")
+                _close_conn_only()
+                s2, f2, banner2 = _open_connection(HOST, PORT)
+                last_connect_info = (s2, f2, banner2)
+                print(banner2)
+                return "[OK] # cancelled by user"
+            if ln == "<<END>>": break
             payload_lines.append(ln)
         payload = "\n".join(payload_lines)
-        if print_reply:
-            print(payload)
+        if print_reply: print(payload)
         return payload
 
     def _replay_upto(count: int):
-        """
-        Replay the first 'count' submissions into a fresh simulation.
-        Suppresses normal OK output; prints errors if any occur.
-        """
         nonlocal submissions
         print(f"# [step_back] restarting and replaying {count} of {len(submissions)} submissions ...")
-
-        # drop existing connection and sim
         _close_conn_only()
         _restart_and_reconnect()
-
         for i, code in enumerate(submissions[:count], 1):
             payload = _send_code_and_read_reply(code, print_reply=False)
             if payload.startswith("[ERROR]"):
-                print(f"# [replay {i}] ERROR while applying a past snippet:")
-                print(payload)
-
+                print(f"# [replay {i}] ERROR while applying a past snippet:\n{payload}")
         print("# [step_back] replay complete.")
 
     print(f"Connecting to {HOST}:{PORT} ...")
     _connect_new_sim()
     _history_init()
-    
+
     buf: list[str] = []
     indent_levels = 0
+    bracket_depth = 0
+    colon_mode = False         # True when a block was started by ':' line
+    in_triple = False          # True when inside '''...''' or """..."""
+    triple_delim = ""          # either "'''" or '"""'
 
     re_stepback_call = re.compile(r"^\s*step_back\s*\(\s*(\d+)\s*\)\s*$")
     re_colon_stepback = re.compile(r"^\s*:\s*(?:stepback|rewind)\s+(\d+)\s*$")
 
     def _set_default_indent(level: int):
-        """Pre-fill the input line with indentation for a nicer UX."""
         spaces = " " * (max(level, 0) * 4)
-
         def hook():
             try:
                 readline.insert_text(spaces)
                 readline.redisplay()
             finally:
                 readline.set_pre_input_hook(None)
-
         try:
             if sys.stdin.isatty():
                 readline.set_pre_input_hook(hook)
         except Exception:
             pass
 
+    def _bracket_delta(s: str) -> int:
+        # naive but effective: counts (), [], {}
+        return (s.count("(") - s.count(")")) + (s.count("[") - s.count("]")) + (s.count("{") - s.count("}"))
+
+    def _strip_comment(line: str) -> str:
+        """Strip trailing # comment, respecting single-quoted strings."""
+        in_str = None
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if in_str:
+                if ch == "\\" :
+                    i += 2
+                    continue
+                if ch == in_str:
+                    in_str = None
+            elif ch in ('"', "'"):
+                in_str = ch
+            elif ch == "#":
+                return line[:i].rstrip()
+            i += 1
+        return line.rstrip()
+
+    def _triple_toggle(line: str):
+        """
+        Toggle triple-quote state if an odd number of the active delimiter appears in the line.
+        If not currently in triple mode, detect the first occurrence of ''' or \"\"\".
+        """
+        nonlocal in_triple, triple_delim
+        if in_triple:
+            cnt = line.count(triple_delim)
+            if cnt % 2 == 1:
+                in_triple = False
+                triple_delim = ""
+        else:
+            i1 = line.find("'''")
+            i2 = line.find('"""')
+            if i1 == -1 and i2 == -1:
+                return
+            if i1 != -1 and (i2 == -1 or i1 < i2):
+                triple_delim = "'''"
+            else:
+                triple_delim = '"""'
+            # if same delimiter also closes on the same line (e.g. '''x'''), count toggles
+            cnt = line.count(triple_delim)
+            in_triple = (cnt % 2 == 1)
+
     try:
         while True:
             prompt = ">>> " if not buf else "... "
-
             if buf or indent_levels > 0:
                 _set_default_indent(indent_levels)
             try:
@@ -577,9 +697,9 @@ def _client_loop(sim_dir: str):
             except EOFError:
                 line = ":quit"
 
-            # ':' commands (local) -----
+            # local ':' commands when not collecting a block
             m = re_colon_stepback.match(line)
-            if m and not buf:
+            if m and not buf and not in_triple:
                 n = int(m.group(1))
                 keep = max(0, len(submissions) - n)
                 _replay_upto(keep)
@@ -592,12 +712,19 @@ def _client_loop(sim_dir: str):
                     _terminate_sim(sim_proc)
                 break
 
-            if not buf and line.strip() == "":
+            if not buf and not in_triple and line.strip() in (":clear", ":cls"):
+                print("\033[2J\033[H", end="", flush=True)  # ANSI clear screen + move cursor home
                 continue
 
-            # SINGLE-LINE MODE
-            starts_block = line.rstrip().endswith(":")
-            if not buf and not starts_block:
+            if not buf and not in_triple and line.strip() == "":
+                continue
+
+            # compute grouping signals
+            delta = 0 if in_triple else _bracket_delta(line)
+            starts_colon_block = (not in_triple) and _strip_comment(line).endswith(":")
+
+            # Stepback single-line shortcut (only if not inside a block)
+            if not buf and not in_triple:
                 m = re_stepback_call.match(line)
                 if m:
                     n = int(m.group(1))
@@ -606,16 +733,71 @@ def _client_loop(sim_dir: str):
                     indent_levels = 0
                     continue
 
+            # Triple-quote state update must happen after checks above
+            _triple_toggle(line)
+
+            # SINGLE-LINE or START BLOCK
+            if not buf:
+                if starts_colon_block:
+                    buf.append(line)
+                    colon_mode = True
+                    bracket_depth = delta
+                    indent_levels = (len(line) - len(line.lstrip(" "))) // 4 + 1
+                    continue
+
+                if delta > 0 or in_triple:
+                    # start implicit paren block or triple-quoted block
+                    buf.append(line)
+                    colon_mode = False
+                    bracket_depth = delta
+                    indent_levels = 0
+                    continue
+
+                # plain single-line
                 _history_add_line(line)
                 payload = _send_code_and_read_reply(line)
                 submissions.append(line)
                 indent_levels = 0
                 continue
 
-            # BLOCK MODE
-            if line.strip() == "":
+            # We are inside a block (colon or implicit or triple)
+            if colon_mode:
+                if not in_triple and line.strip() == "":
+                    code = "\n".join(buf)
+                    buf.clear()
+                    colon_mode = False
+                    bracket_depth = 0
+
+                    m = re_stepback_call.match(code)
+                    if m:
+                        n = int(m.group(1))
+                        keep = max(0, len(submissions) - n)
+                        _replay_upto(keep)
+                        indent_levels = 0
+                        continue
+
+                    _history_add_line(code)
+                    payload = _send_code_and_read_reply(code)
+                    submissions.append(code)
+                    indent_levels = 0
+                    continue
+
+                # still inside colon block
+                buf.append(line)
+                bracket_depth += (0 if in_triple else _bracket_delta(line))
+                indent_levels = (len(line) - len(line.lstrip(" "))) // 4 + (1 if (not in_triple and line.rstrip().endswith(":")) else 0)
+                continue
+
+            # implicit paren/triple block
+            buf.append(line)
+            if not in_triple:
+                bracket_depth += delta
+
+            # closing condition: either brackets balanced (<=0) AND not in triple; or triple closed with balanced brackets
+            if (not in_triple and bracket_depth <= 0):
                 code = "\n".join(buf)
                 buf.clear()
+                bracket_depth = 0
 
                 m = re_stepback_call.match(code)
                 if m:
@@ -631,13 +813,8 @@ def _client_loop(sim_dir: str):
                 indent_levels = 0
                 continue
 
-            buf.append(line)
-
-            # Compute indentation for the next line:
-            stripped = line.lstrip(" ")
-            leading_spaces = len(line) - len(stripped)
-            current_level = max(leading_spaces // 4, 0)
-            indent_levels = current_level + (1 if stripped.endswith(":") else 0)
+            # still collecting implicit/triple block
+            indent_levels = 0
 
     except KeyboardInterrupt:
         print("\n# Caught KeyboardInterrupt, cleaning up...")
