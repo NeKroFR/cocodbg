@@ -22,6 +22,7 @@ class CocotbDebugConfig:
             lang="vhdl",
             clk_signal="clk",
             clk_period_ns=10.0,
+            extra_args={"GHDL_ARGS": "--std=08"},
         ).run()
     """
 
@@ -38,6 +39,7 @@ class CocotbDebugConfig:
         clk_period_ns: float = 10.0,
         port: int = 9999,
         host: str = "127.0.0.1",
+        extra_args: dict[str, str] | None = None,
     ):
         self.toplevel = toplevel
         self.sources = [os.path.abspath(s) for s in sources]
@@ -47,6 +49,7 @@ class CocotbDebugConfig:
         self.clk_period_ns = float(clk_period_ns)
         self.port = port
         self.host = host
+        self.extra_args = dict(extra_args) if extra_args else {}
 
     def _target_dir(self) -> str:
         return os.path.abspath(self._COCODBG_DIR)
@@ -60,12 +63,15 @@ class CocotbDebugConfig:
         sources_str = " ".join(self.sources)
         toplevel_lang = "verilog" if self.lang in ("verilog", "sv", "systemverilog") else self.lang
 
+        extra = "".join(f"{k} = {v}\n" for k, v in self.extra_args.items())
+
         content = (
             f"SIM = {self.sim}\n"
             f"TOPLEVEL_LANG = {toplevel_lang}\n"
             f"TOPLEVEL = {self.toplevel}\n"
             f"MODULE = cocodbg.executor\n"
             f"{src_var} = {sources_str}\n"
+            f"{extra}"
             f"\n"
             f"export PYTHONPATH := $(abspath .):$(abspath ..):$(PYTHONPATH)\n"
             f"include $(shell cocotb-config --makefiles)/Makefile.sim\n"
