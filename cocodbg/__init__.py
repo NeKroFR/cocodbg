@@ -1,9 +1,14 @@
+from importlib.metadata import version, PackageNotFoundError
+
 from ._server import CocotbDebugger, Command
 from ._ast import wrap_code_as_async, format_exception
 from ._client import start_sim
 from ._config import CocotbDebugConfig
 
-__version__ = "0.1.0"
+try:
+    __version__ = version("cocodbg")
+except PackageNotFoundError:
+    __version__ = "unknown"
 
 __all__ = [
     "CocotbDebugger",

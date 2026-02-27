@@ -288,19 +288,27 @@ def _client_loop(sim_dir: str, host: str = "127.0.0.1", port: int = 9999):
         return depth
 
     def _strip_comment(line: str) -> str:
-        in_str = None
         i = 0
-        while i < len(line):
+        n = len(line)
+        while i < n:
             ch = line[i]
-            if in_str:
-                if ch == "\\":
-                    i += 2
+            if ch in ('"', "'"):
+                q = line[i:i+3]
+                if q in ('"""', "'''"):
+                    close = line.find(q, i + 3)
+                    i = (close + 3) if close != -1 else n
                     continue
-                if ch == in_str:
-                    in_str = None
-            elif ch in ('"', "'"):
-                in_str = ch
-            elif ch == "#":
+                i += 1
+                while i < n:
+                    if line[i] == "\\":
+                        i += 2
+                        continue
+                    if line[i] == ch:
+                        i += 1
+                        break
+                    i += 1
+                continue
+            if ch == "#":
                 return line[:i].rstrip()
             i += 1
         return line.rstrip()
