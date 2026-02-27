@@ -17,8 +17,10 @@ import subprocess
 import fcntl
 from typing import Any, Awaitable, Callable
 
-DBG_HOST = "127.0.0.1"
-DBG_PORT = 9999
+DBG_HOST = os.environ.get("COCODBG_HOST", "127.0.0.1")
+DBG_PORT = int(os.environ.get("COCODBG_PORT", "9999"))
+_CLK_SIGNAL = os.environ.get("COCODBG_CLK_SIGNAL", "clk")
+_CLK_PERIOD_NS = float(os.environ.get("COCODBG_CLK_PERIOD_NS", "10.0"))
 
 def format_user_input(code: str) -> str:
     """
@@ -42,8 +44,10 @@ async def cocodbg(dut):
     dbg.start()
     dut._log.info(f"[cocotb-dbg] listening on {DBG_HOST}:{DBG_PORT}")
 
+    clk_handle = getattr(dut, _CLK_SIGNAL, None)
+
     # Clock/run control exposed in the REPL
-    CLK = {"task": None, "period_ns": 10.0}  # default 100 MHz
+    CLK = {"task": None, "period_ns": _CLK_PERIOD_NS}
 
     # helpers: time conversion
     def _to_ns(value, units: str) -> float:
@@ -86,7 +90,7 @@ async def cocodbg(dut):
 
     async def start_clock(period_ns: float | None = None):
         """
-        Start a FREE-RUNNING clock on dut.clk with given period (ns).
+        Start a FREE-RUNNING clock on clk_handle with given period (ns).
         WARNING: Once started, time will advance autonomously until stop_clock().
         """
         p = float(period_ns if period_ns is not None else CLK["period_ns"])
@@ -95,7 +99,9 @@ async def cocodbg(dut):
             CLK["task"] = None
         CLK["period_ns"] = p
         _snapshot_commit_now()
-        CLK["task"] = cocotb.start_soon(Clock(dut.clk, p, units="ns").start())
+        if clk_handle is None:
+            raise RuntimeError(f"Clock signal '{_CLK_SIGNAL}' not found on DUT")
+        CLK["task"] = cocotb.start_soon(Clock(clk_handle, p, units="ns").start())
 
     async def stop_clock(freeze: str = "low"):
         """
@@ -108,10 +114,10 @@ async def cocodbg(dut):
             CLK["task"] = None
         if freeze == "low":
             with contextlib.suppress(Exception):
-                dut.clk.value = 0
+                clk_handle.value = 0
         elif freeze == "high":
             with contextlib.suppress(Exception):
-                dut.clk.value = 1
+                clk_handle.value = 1
         _snapshot_commit_now()
 
     async def set_clock_rate(period_value, units: str = "ns"):
@@ -149,23 +155,23 @@ async def cocodbg(dut):
         second_half_ps = half_ps
 
         with contextlib.suppress(Exception):
-            dut.clk.value = 0
+            clk_handle.value = 0
         await Timer(1, units="step")
         # Emit clk event now
-        _emit_single_signal_now(dut.clk)
+        _emit_single_signal_now(clk_handle)
 
         for _ in range(int(n)):
             if dbg.cancel_evt.is_set():
                 break
             await _await_time_ps(first_half_ps)
-            dut.clk.value = 1
+            clk_handle.value = 1
             await Timer(1, units="step")
-            _emit_single_signal_now(dut.clk)
+            _emit_single_signal_now(clk_handle)
 
             await _await_time_ps(second_half_ps)
-            dut.clk.value = 0
+            clk_handle.value = 0
             await Timer(1, units="step")
-            _emit_single_signal_now(dut.clk)
+            _emit_single_signal_now(clk_handle)
 
         _snapshot_commit_now()
 
@@ -191,9 +197,9 @@ async def cocodbg(dut):
         # start from a known phase
         lvl = 0
         with contextlib.suppress(Exception):
-            dut.clk.value = lvl
+            clk_handle.value = lvl
         await Timer(1, units="step")
-        _emit_single_signal_now(dut.clk)
+        _emit_single_signal_now(clk_handle)
 
         rem = int(total_ps)
         while rem > 0:
@@ -205,9 +211,9 @@ async def cocodbg(dut):
                 break
             await _await_time_ps(first_half_ps)
             lvl = 1
-            dut.clk.value = lvl
+            clk_handle.value = lvl
             await Timer(1, units="step")
-            _emit_single_signal_now(dut.clk)
+            _emit_single_signal_now(clk_handle)
             rem -= first_half_ps
 
             # second half, if we can't fit it, we stop high
@@ -216,16 +222,16 @@ async def cocodbg(dut):
                 break
             await _await_time_ps(second_half_ps)
             lvl = 0
-            dut.clk.value = lvl
+            clk_handle.value = lvl
             await Timer(1, units="step")
-            _emit_single_signal_now(dut.clk)
+            _emit_single_signal_now(clk_handle)
             rem -= second_half_ps
 
         # final freeze policy
         if freeze == "low" and lvl != 0:
-            dut.clk.value = 0 # may create a zero-time falling edge
+            clk_handle.value = 0 # may create a zero-time falling edge
         elif freeze == "high" and lvl != 1:
-            dut.clk.value = 1 # may create a zero-time rising edge
+            clk_handle.value = 1 # may create a zero-time rising edge
 
     async def run_for(t, units: str = "ns", freeze: str = "preserve"):
         """
@@ -819,7 +825,7 @@ async def cocodbg(dut):
             return await _maybe_await(res)
         return _runner
 
-    async def _advance_once(granularity, clk_handle):
+    async def _advance_once(granularity, clk_param=None):
         """
         Advance time by one unit according to granularity.
         Returns the number of *cycles* consumed (0/1) for accounting.
@@ -834,7 +840,7 @@ async def cocodbg(dut):
             return 0
 
         if granularity == "edge":
-            clkh = clk_handle or getattr(dut, "clk", None)
+            clkh = clk_param or clk_handle
             if clkh is None:
                 # Fallback to half-period manual toggle
                 half_ps = int(round(float(CLK["period_ns"]) * 1_000.0 / 2.0))
@@ -845,7 +851,7 @@ async def cocodbg(dut):
 
         # default: "cycle"
         if CLK["task"] is not None:
-            clkx = clk_handle or getattr(dut, "clk", None)
+            clkx = clk_param or clk_handle
             if clkx is None:
                 await _temp_free_run_for_ps(int(round(float(CLK["period_ns"]) * 1_000.0)), freeze="preserve")
                 return 1
@@ -1021,7 +1027,7 @@ async def cocodbg(dut):
     exec_globals = {
         # DUT + cocotb primitives
         "dut": dut,
-        "clk": dut.clk,
+        "clk": clk_handle,
         "cocotb": cocotb,
         "Timer": Timer,
         "RisingEdge": RisingEdge,
@@ -1053,6 +1059,30 @@ async def cocodbg(dut):
         # wait-until features
         "wait_until": wait_until,
     }
+
+    def show_sigs():
+        _ensure_vcd_initialized()
+        for name, sig in VCD["pairs"]:
+            try:
+                print(f"  {name} = {sig.value}")
+            except Exception:
+                print(f"  {name} = <unreadable>")
+
+    def show_vars():
+        user = {k: v for k, v in exec_globals.items()
+                if k not in _initial_exec_names and not k.startswith("_")}
+        if not user:
+            print("  (none)")
+        else:
+            for k, v in sorted(user.items()):
+                print(f"  {k} = {repr(v)}")
+
+    def list_signals():
+        _ensure_vcd_initialized()
+        return [name for name, _ in VCD["pairs"]]
+
+    exec_globals.update({"show_sigs": show_sigs, "show_vars": show_vars, "list_signals": list_signals})
+    _initial_exec_names = frozenset(exec_globals)
 
     def _cmpwrap(op):
         def _impl(self, other):

@@ -7,6 +7,7 @@ import sys
 import os
 import time
 import subprocess
+import shutil
 from typing import Tuple
 import ast
 import readline
@@ -347,6 +348,43 @@ def format_exception() -> str:
 # Launcher / Client (CLI)
 # =======================
 
+_C_OK    = "\033[92m"
+_C_ERR   = "\033[91m"
+_C_RESET = "\033[0m"
+
+_BUILTIN_NAMES = frozenset({
+    "dut", "clk", "cocotb", "Timer", "RisingEdge", "FallingEdge", "Clock",
+    "BinaryValue", "start_clock", "stop_clock", "set_clock_rate", "step",
+    "run_for", "cycles", "as_uint", "as_sint", "start_vcd", "stop_vcd",
+    "gen_vcd", "view_vcd", "gtkwave_live_start", "gtkwave_live_stop",
+    "wait_until", "show_sigs", "show_vars", "list_signals",
+})
+
+_COLON_CMDS = [
+    ":quit", ":q", ":clear", ":cls", ":stepback", ":rewind",
+    ":n", ":c", ":p", ":b", ":r", ":vars", ":sig",
+]
+
+
+def _fmt_reply(payload: str) -> str:
+    if payload.startswith("[OK]"):
+        lines = payload.splitlines()
+        lines[0] = _C_OK + lines[0] + _C_RESET
+        return "\n".join(lines)
+    if payload.startswith("[ERROR]"):
+        return _C_ERR + payload + _C_RESET
+    return payload
+
+
+def _make_completer(user_names: set[str]):
+    def completer(text, state):
+        if text.startswith(":"):
+            options = [c for c in _COLON_CMDS if c.startswith(text)]
+        else:
+            options = sorted(n for n in (_BUILTIN_NAMES | user_names) if n.startswith(text))
+        return options[state] if state < len(options) else None
+    return completer
+
 HOST = "127.0.0.1"
 PORT = 9999
 
@@ -447,7 +485,7 @@ def _kill_process_group_by_pid(pid: int):
     with contextlib.suppress(Exception):
         os.kill(pid, signal.SIGKILL)
 
-def _preflight_cleanup():
+def _preflight_cleanup(host: str, port: int):
     """
     Before launching a new sim, try to clean up any leftovers.
     It kills by PID from pidfile (group-aware) and then waits for TCP port to be fully closed.
@@ -456,7 +494,7 @@ def _preflight_cleanup():
     if pid:
         _kill_process_group_by_pid(pid)
         _remove_pidfile()
-    _wait_for_port_closed(HOST, PORT, timeout=5.0)
+    _wait_for_port_closed(host, port, timeout=5.0)
 
 def _launch_sim(sim_dir: str) -> tuple[subprocess.Popen, tuple[threading.Thread, threading.Thread]]:
     """
@@ -479,7 +517,7 @@ def _launch_sim(sim_dir: str) -> tuple[subprocess.Popen, tuple[threading.Thread,
     tails = _tail_proc(sim_proc)
     return sim_proc, tails
 
-def _terminate_sim(sim_proc: subprocess.Popen):
+def _terminate_sim(sim_proc: subprocess.Popen, host: str = "127.0.0.1", port: int = 9999):
     """
     Terminate the simulation process safely and wait for port to close.
     Kills the entire process group to avoid straggler 'make', 'ghdl', etc.
@@ -502,10 +540,10 @@ def _terminate_sim(sim_proc: subprocess.Popen):
                 with contextlib.suppress(Exception):
                     sim_proc.wait(timeout=3)
     finally:
-        _wait_for_port_closed(HOST, PORT, timeout=10.0)
+        _wait_for_port_closed(host, port, timeout=10.0)
         _remove_pidfile()
 
-def _client_loop(sim_dir: str):
+def _client_loop(sim_dir: str, host: str = "127.0.0.1", port: int = 9999):
     """
     Manage the whole interactive session, including restarts and step_back().
     Groups user input into one snippet when:
@@ -519,18 +557,18 @@ def _client_loop(sim_dir: str):
 
     def _connect_new_sim():
         nonlocal sim_proc, last_connect_info
-        _preflight_cleanup()
+        _preflight_cleanup(host, port)
 
         sim_proc, _ = _launch_sim(sim_dir)
 
-        print(f"waiting for {HOST}:{PORT} ...")
-        if not _wait_for_port_open(HOST, PORT, timeout=60.0):
+        print(f"waiting for {host}:{port} ...")
+        if not _wait_for_port_open(host, port, timeout=60.0):
             print("Error: debugger port did not open in time.")
             if sim_proc is not None:
-                _terminate_sim(sim_proc)
+                _terminate_sim(sim_proc, host, port)
             sys.exit(1)
 
-        s, f, banner = _open_connection(HOST, PORT)
+        s, f, banner = _open_connection(host, port)
         last_connect_info = (s, f, banner)
         print(banner)
         print("# Auto-detect blocks: lines ending with ':' start a block; finish with a blank line.")
@@ -552,7 +590,7 @@ def _client_loop(sim_dir: str):
     def _restart_and_reconnect():
         nonlocal sim_proc
         if sim_proc is not None:
-            _terminate_sim(sim_proc)
+            _terminate_sim(sim_proc, host, port)
             sim_proc = None
         time.sleep(0.05)
         _connect_new_sim()
@@ -598,7 +636,8 @@ def _client_loop(sim_dir: str):
             if ln == "<<END>>": break
             payload_lines.append(ln)
         payload = "\n".join(payload_lines)
-        if print_reply: print(payload)
+        if print_reply:
+            print(_fmt_reply(payload) if sys.stdout.isatty() else payload)
         return payload
 
     def _replay_upto(count: int):
@@ -612,9 +651,23 @@ def _client_loop(sim_dir: str):
                 print(f"# [replay {i}] ERROR while applying a past snippet:\n{payload}")
         print("# [step_back] replay complete.")
 
-    print(f"Connecting to {HOST}:{PORT} ...")
+    print(f"Connecting to {host}:{port} ...")
     _connect_new_sim()
     _history_init()
+
+    _user_names: set[str] = set()
+    try:
+        _sig_raw = _send_code_and_read_reply("list_signals()", print_reply=False)
+        if _sig_raw.startswith("[OK] "):
+            _user_names.update(f"dut.{n}" for n in ast.literal_eval(_sig_raw[5:].strip()))
+    except Exception:
+        pass
+    readline.set_completer(_make_completer(_user_names))
+    readline.parse_and_bind("tab: complete")
+
+    _tty = sys.stdout.isatty()
+    _PROMPT      = "\001\033[96m\002>>>\001\033[0m\002 " if _tty else ">>> "
+    _PROMPT_CONT = "\001\033[2m\002...\001\033[0m\002 " if _tty else "... "
 
     buf: list[str] = []
     indent_levels = 0
@@ -689,7 +742,7 @@ def _client_loop(sim_dir: str):
 
     try:
         while True:
-            prompt = ">>> " if not buf else "... "
+            prompt = _PROMPT if not buf else _PROMPT_CONT
             if buf or indent_levels > 0:
                 _set_default_indent(indent_levels)
             try:
@@ -709,7 +762,7 @@ def _client_loop(sim_dir: str):
             if line.strip() in (":quit", ":q"):
                 _close_conn_only()
                 if sim_proc is not None:
-                    _terminate_sim(sim_proc)
+                    _terminate_sim(sim_proc, host, port)
                 break
 
             if not buf and not in_triple and line.strip() in (":clear", ":cls"):
@@ -718,6 +771,31 @@ def _client_loop(sim_dir: str):
 
             if not buf and not in_triple and line.strip() == "":
                 continue
+
+            if not buf and not in_triple:
+                _s = line.strip()
+                if _s == ":n":
+                    line = "await step()"
+                elif _s == ":r":
+                    _replay_upto(0)
+                    indent_levels = 0
+                    continue
+                elif _s == ":vars":
+                    line = "show_vars()"
+                elif _s == ":sig":
+                    line = "show_sigs()"
+                elif _s.startswith(":p "):
+                    line = _s[3:].strip()
+                elif _s.startswith(":c"):
+                    parts = _s[2:].strip().split()
+                    if not parts:
+                        line = "await cycles(1)"
+                    elif len(parts) == 1:
+                        line = f"await cycles({parts[0]})"
+                    else:
+                        line = f'await run_for({parts[0]}, "{parts[1]}")'
+                elif _s.startswith(":b "):
+                    line = f"await wait_until(lambda: {_s[3:].strip()})"
 
             # compute grouping signals
             delta = 0 if in_triple else _bracket_delta(line)
@@ -757,6 +835,11 @@ def _client_loop(sim_dir: str):
                 _history_add_line(line)
                 payload = _send_code_and_read_reply(line)
                 submissions.append(line)
+                if payload.startswith("[OK]"):
+                    try:
+                        _user_names.update(_assigned_at_toplevel(ast.parse(line)))
+                    except Exception:
+                        pass
                 indent_levels = 0
                 continue
 
@@ -779,6 +862,11 @@ def _client_loop(sim_dir: str):
                     _history_add_line(code)
                     payload = _send_code_and_read_reply(code)
                     submissions.append(code)
+                    if payload.startswith("[OK]"):
+                        try:
+                            _user_names.update(_assigned_at_toplevel(ast.parse(code)))
+                        except Exception:
+                            pass
                     indent_levels = 0
                     continue
 
@@ -810,6 +898,11 @@ def _client_loop(sim_dir: str):
                 _history_add_line(code)
                 payload = _send_code_and_read_reply(code)
                 submissions.append(code)
+                if payload.startswith("[OK]"):
+                    try:
+                        _user_names.update(_assigned_at_toplevel(ast.parse(code)))
+                    except Exception:
+                        pass
                 indent_levels = 0
                 continue
 
@@ -820,21 +913,127 @@ def _client_loop(sim_dir: str):
         print("\n# Caught KeyboardInterrupt, cleaning up...")
         _close_conn_only()
         if sim_proc is not None:
-            _terminate_sim(sim_proc)
+            _terminate_sim(sim_proc, host, port)
         return
 
-def start_sim(sim_dir):
+def start_sim(sim_dir: str, host: str = "127.0.0.1", port: int = 9999):
     """
     Start/drive the interactive client session.
     """
     try:
-        _client_loop(sim_dir)
+        _client_loop(sim_dir, host, port)
     finally:
         pid = _read_pidfile()
         if pid:
             _kill_process_group_by_pid(pid)
             _remove_pidfile()
-        _wait_for_port_closed(HOST, PORT, timeout=5.0)
+        _wait_for_port_closed(host, port, timeout=5.0)
+
+class CocotbDebugConfig:
+    """
+    Configuration for a cocodbg session.
+
+    Generates a hidden .cocodbg/ directory with a Makefile and executor test file,
+    launches the simulation, then cleans everything up on exit.
+
+    Usage::
+
+        from cocodbg import CocotbDebugConfig
+
+        CocotbDebugConfig(
+            toplevel="adder",
+            sources=["adder.vhd"],
+            sim="ghdl",
+            lang="vhdl",
+            clk_signal="clk",
+            clk_period_ns=10.0,
+        ).run()
+    """
+
+    _COCODBG_DIR = ".cocodbg"
+
+    def __init__(
+        self,
+        toplevel: str,
+        sources: list[str],
+        *,
+        sim: str = "ghdl",
+        lang: str = "vhdl",
+        clk_signal: str = "clk",
+        clk_period_ns: float = 10.0,
+        port: int = 9999,
+        host: str = "127.0.0.1",
+    ):
+        self.toplevel = toplevel
+        self.sources = [os.path.abspath(s) for s in sources]
+        self.sim = sim
+        self.lang = lang.lower()
+        self.clk_signal = clk_signal
+        self.clk_period_ns = float(clk_period_ns)
+        self.port = port
+        self.host = host
+
+    def _target_dir(self) -> str:
+        return os.path.abspath(self._COCODBG_DIR)
+
+    def _write_makefile(self, target_dir: str):
+        if self.lang == "vhdl":
+            src_var = "VHDL_SOURCES"
+        else:
+            src_var = "VERILOG_SOURCES"
+
+        sources_str = " ".join(self.sources)
+        toplevel_lang = "verilog" if self.lang in ("verilog", "sv", "systemverilog") else self.lang
+
+        content = (
+            f"SIM = {self.sim}\n"
+            f"TOPLEVEL_LANG = {toplevel_lang}\n"
+            f"TOPLEVEL = {self.toplevel}\n"
+            f"MODULE = _cocodbg_test\n"
+            f"{src_var} = {sources_str}\n"
+            f"\n"
+            f"export PYTHONPATH := $(abspath .):$(abspath ..):$(PYTHONPATH)\n"
+            f"include $(shell cocotb-config --makefiles)/Makefile.sim\n"
+        )
+        with open(os.path.join(target_dir, "Makefile"), "w") as f:
+            f.write(content)
+
+    def _write_executor(self, target_dir: str):
+        executor_src = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "tests", "test_cocodbg.py"
+        )
+        if not os.path.exists(executor_src):
+            raise FileNotFoundError(
+                f"Executor template not found: {executor_src}\n"
+                "Make sure tests/test_cocodbg.py exists alongside cocodbg.py."
+            )
+        shutil.copy2(executor_src, os.path.join(target_dir, "_cocodbg_test.py"))
+
+    def run(self):
+        """Generate .cocodbg/, run the simulation, clean up on exit."""
+        target_dir = self._target_dir()
+
+        # Clean up any leftover directory from a previous crash
+        if os.path.isdir(target_dir):
+            if os.path.exists(os.path.join(target_dir, "_cocodbg_test.py")):
+                print("# Found leftover .cocodbg/ from a previous session, cleaning up...")
+                shutil.rmtree(target_dir, ignore_errors=True)
+
+        os.makedirs(target_dir, exist_ok=True)
+        self._write_makefile(target_dir)
+        self._write_executor(target_dir)
+
+        # Pass config to the executor via env vars
+        os.environ["COCODBG_HOST"] = self.host
+        os.environ["COCODBG_PORT"] = str(self.port)
+        os.environ["COCODBG_CLK_SIGNAL"] = self.clk_signal
+        os.environ["COCODBG_CLK_PERIOD_NS"] = str(self.clk_period_ns)
+
+        try:
+            start_sim(target_dir, host=self.host, port=self.port)
+        finally:
+            shutil.rmtree(target_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     start_sim("tests")
