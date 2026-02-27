@@ -514,7 +514,7 @@ async def cocodbg(dut):
             _emit_events(t_ps, {vid: ch})
 
     # -------- File VCD dump --------
-    async def start_vcd(signals=None):
+    async def start_vcd():
         _ensure_vcd_initialized()
         # Capture current signal state into VCD["last"], then start a fresh recording.
         for _, sig in VCD["pairs"]:

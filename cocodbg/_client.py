@@ -71,9 +71,9 @@ def _print_help():
     print(
         "colon commands:\n"
         "  :q / :quit          stop simulation and exit\n"
-        "  :r / :restart       restart simulation, replay all previous inputs\n"
-        "  :stepback N         replay up to N submissions back\n"
-        "  :n                  step one clock cycle (alias for await step())\n"
+        "  :r                  restart simulation, replay all previous inputs\n"
+        "  :stepback N / :rewind N  replay up to N submissions back\n"
+        "  :n                  advance one simulation delta, no time advance (alias for await step())\n"
         "  :c [N] [unit]       advance N cycles or run_for N unit\n"
         "  :b <expr>           wait until lambda: <expr> is true\n"
         "  :p <expr>           print <expr>\n"
@@ -373,7 +373,7 @@ def _client_loop(sim_dir: str, host: str = "127.0.0.1", port: int = 9999):
                 if _s == ":n":
                     line = "await step()"
                 elif _s == ":r":
-                    _replay_upto(0)
+                    _replay_upto(len(submissions))
                     indent_levels = 0
                     continue
                 elif _s == ":vars":
