@@ -46,8 +46,24 @@ async def cocodbg(dut):
 
     clk_handle = getattr(dut, _CLK_SIGNAL, None)
 
-    # Clock/run control exposed in the REPL
-    CLK = {"task": None, "period_ns": _CLK_PERIOD_NS}
+    # Clock domains: name -> {handle, task, period_ns}
+    CLOCKS = {
+        "default": {"handle": clk_handle, "task": None, "period_ns": _CLK_PERIOD_NS},
+    }
+    CLK = CLOCKS["default"]  # backwards-compat alias
+
+    def _get_clk(clk=None):
+        if clk is None:
+            return CLOCKS["default"]
+        if isinstance(clk, str):
+            if clk not in CLOCKS:
+                raise ValueError(f"Unknown clock domain: '{clk}'. Register with register_clock().")
+            return CLOCKS[clk]
+        # raw handle — find matching registered domain or build a transient one
+        for domain in CLOCKS.values():
+            if domain["handle"] is clk:
+                return domain
+        return {"handle": clk, "task": None, "period_ns": CLOCKS["default"]["period_ns"]}
 
     # helpers: time conversion
     def _to_ns(value, units: str) -> float:
@@ -88,46 +104,51 @@ async def cocodbg(dut):
                     return
                 await Timer(int(count), units=unit)
 
-    async def start_clock(period_ns: float | None = None):
+    async def start_clock(period_ns: float | None = None, clk=None):
         """
-        Start a FREE-RUNNING clock on clk_handle with given period (ns).
+        Start a FREE-RUNNING clock on the given domain (default: "default").
         WARNING: Once started, time will advance autonomously until stop_clock().
         """
-        p = float(period_ns if period_ns is not None else CLK["period_ns"])
-        if CLK["task"] is not None:
-            CLK["task"].kill()
-            CLK["task"] = None
-        CLK["period_ns"] = p
+        domain = _get_clk(clk)
+        p = float(period_ns if period_ns is not None else domain["period_ns"])
+        if domain["task"] is not None:
+            domain["task"].kill()
+            domain["task"] = None
+        domain["period_ns"] = p
         _snapshot_commit_now()
-        if clk_handle is None:
-            raise RuntimeError(f"Clock signal '{_CLK_SIGNAL}' not found on DUT")
-        CLK["task"] = cocotb.start_soon(Clock(clk_handle, p, units="ns").start())
+        handle = domain["handle"]
+        if handle is None:
+            raise RuntimeError(f"Clock handle for domain '{clk or 'default'}' is None")
+        domain["task"] = cocotb.start_soon(Clock(handle, p, units="ns").start())
 
-    async def stop_clock(freeze: str = "low"):
+    async def stop_clock(freeze: str = "low", clk=None):
         """
-        Stop the free-running clock (if running) and freeze level.
+        Stop the free-running clock on the given domain and freeze its level.
         freeze: "low" (default), "high", or "preserve"
         """
         _snapshot_commit_now()
-        if CLK["task"] is not None:
-            CLK["task"].kill()
-            CLK["task"] = None
-        if freeze == "low":
-            with contextlib.suppress(Exception):
-                clk_handle.value = 0
-        elif freeze == "high":
-            with contextlib.suppress(Exception):
-                clk_handle.value = 1
+        domain = _get_clk(clk)
+        if domain["task"] is not None:
+            domain["task"].kill()
+            domain["task"] = None
+        handle = domain["handle"]
+        if handle is not None:
+            if freeze == "low":
+                with contextlib.suppress(Exception):
+                    handle.value = 0
+            elif freeze == "high":
+                with contextlib.suppress(Exception):
+                    handle.value = 1
         _snapshot_commit_now()
 
-    async def set_clock_rate(period_value, units: str = "ns"):
+    async def set_clock_rate(period_value, units: str = "ns", clk=None):
         """
-        Set the default clock period used by run_for / cycles.
+        Set the period for the given clock domain.
         Leaves the clock STOPPED (frozen low for determinism).
         """
         _snapshot_commit_now()
-        await stop_clock(freeze="low")
-        CLK["period_ns"] = _to_ns(period_value, units)
+        await stop_clock(freeze="low", clk=clk)
+        _get_clk(clk)["period_ns"] = _to_ns(period_value, units)
         _snapshot_commit_now()
 
     async def step():
@@ -136,50 +157,52 @@ async def cocodbg(dut):
         await Timer(1, units="step")
         _snapshot_commit_now()
 
-    async def cycles(n: int, period_ns: float | None = None):
+    async def cycles(n: int, period_ns: float | None = None, clk=None):
         """
-        Drive EXACTLY n clock cycles *manually* (no background run afterwards).
-        - If a free-running clock is active, stop it first (avoid double-driving).
-        - period_ns defaults to CLK["period_ns"].
+        Drive EXACTLY n clock cycles *manually* on the given domain.
+        - If a free-running clock is active on that domain, stop it first.
+        - period_ns defaults to the domain's period_ns.
         - Uses integer picoseconds throughout, so it's drift-free.
         """
         _snapshot_commit_now()
 
-        if CLK["task"] is not None:
-            await stop_clock()
+        domain = _get_clk(clk)
+        handle = domain["handle"]
 
-        p_ns = float(CLK["period_ns"] if period_ns is None else period_ns)
+        if domain["task"] is not None:
+            await stop_clock(clk=clk)
+
+        p_ns = float(domain["period_ns"] if period_ns is None else period_ns)
         period_ps = int(round(p_ns * 1_000.0)) # 1 ns = 1000 ps
         half_ps = period_ps // 2
         first_half_ps = half_ps + (period_ps - 2 * half_ps)
         second_half_ps = half_ps
 
         with contextlib.suppress(Exception):
-            clk_handle.value = 0
+            handle.value = 0
         await Timer(1, units="step")
-        # Emit clk event now
-        _emit_single_signal_now(clk_handle)
+        _emit_single_signal_now(handle)
 
         for _ in range(int(n)):
             if dbg.cancel_evt.is_set():
                 break
             await _await_time_ps(first_half_ps)
-            clk_handle.value = 1
+            handle.value = 1
             await Timer(1, units="step")
-            _emit_single_signal_now(clk_handle)
+            _emit_single_signal_now(handle)
 
             await _await_time_ps(second_half_ps)
-            clk_handle.value = 0
+            handle.value = 0
             await Timer(1, units="step")
-            _emit_single_signal_now(clk_handle)
+            _emit_single_signal_now(handle)
 
         _snapshot_commit_now()
 
-    async def _temp_free_run_for_ps(total_ps: int, freeze: str = "preserve"):
+    async def _temp_free_run_for_ps(total_ps: int, freeze: str = "preserve", clk=None):
         """
-        Phase-safe temporary free run:
+        Phase-safe temporary free run on the given clock domain:
           - Starts at clk=0.
-          - Manually toggles using the configured period for at most total_ps.
+          - Manually toggles using the domain's period for at most total_ps.
           - Guarantees NO rising edge if total_ps < half-period.
           - At the end, 'freeze' controls the final level: "preserve" | "low" | "high".
         """
@@ -188,54 +211,52 @@ async def cocodbg(dut):
         if total_ps <= 0:
             return
 
-        p_ns = float(CLK["period_ns"])
+        domain = _get_clk(clk)
+        handle = domain["handle"]
+        p_ns = float(domain["period_ns"])
         period_ps = int(round(p_ns * 1_000.0)) # 1 ns = 1000 ps
         half_ps = period_ps // 2
         first_half_ps = half_ps + (period_ps - 2 * half_ps)
         second_half_ps = half_ps
 
-        # start from a known phase
         lvl = 0
         with contextlib.suppress(Exception):
-            clk_handle.value = lvl
+            handle.value = lvl
         await Timer(1, units="step")
-        _emit_single_signal_now(clk_handle)
+        _emit_single_signal_now(handle)
 
         rem = int(total_ps)
         while rem > 0:
             if dbg.cancel_evt.is_set():
                 return
-            # first half, no rising edge if we can't fit it
             if rem < first_half_ps:
                 await _await_time_ps(rem)
                 break
             await _await_time_ps(first_half_ps)
             lvl = 1
-            clk_handle.value = lvl
+            handle.value = lvl
             await Timer(1, units="step")
-            _emit_single_signal_now(clk_handle)
+            _emit_single_signal_now(handle)
             rem -= first_half_ps
 
-            # second half, if we can't fit it, we stop high
             if rem < second_half_ps:
                 await _await_time_ps(rem)
                 break
             await _await_time_ps(second_half_ps)
             lvl = 0
-            clk_handle.value = lvl
+            handle.value = lvl
             await Timer(1, units="step")
-            _emit_single_signal_now(clk_handle)
+            _emit_single_signal_now(handle)
             rem -= second_half_ps
 
-        # final freeze policy
         if freeze == "low" and lvl != 0:
-            clk_handle.value = 0 # may create a zero-time falling edge
+            handle.value = 0
         elif freeze == "high" and lvl != 1:
-            clk_handle.value = 1 # may create a zero-time rising edge
+            handle.value = 1
 
-    async def run_for(t, units: str = "ns", freeze: str = "preserve"):
+    async def run_for(t, units: str = "ns", freeze: str = "preserve", clk=None):
         """
-        Advance real time by t, ALWAYS updating the design with clock edges.
+        Advance real time by t on the given clock domain.
           - If a free-running clock is active: just await t (edges come from it).
           - Else: run a phase-safe temporary clock for exactly t, then freeze as requested.
         freeze: "preserve" (default), "low", or "high"
@@ -243,13 +264,14 @@ async def cocodbg(dut):
         _snapshot_commit_now()
 
         total_ps = _to_total_ps(t, units)
+        domain = _get_clk(clk)
 
-        if CLK["task"] is not None:
+        if domain["task"] is not None:
             await _await_time_ps(total_ps)
             _snapshot_commit_now()
             return
 
-        await _temp_free_run_for_ps(total_ps, freeze=freeze)
+        await _temp_free_run_for_ps(total_ps, freeze=freeze, clk=clk)
 
     ### Comparison helpers + auto-coercing comparisons ###
     def _bits_to_int(binstr: str, *, signed: bool = False) -> int:
@@ -836,30 +858,31 @@ async def cocodbg(dut):
 
         if isinstance(granularity, tuple) and len(granularity) == 3 and granularity[0] == "time":
             _, val, units = granularity
-            await run_for(val, units, freeze="preserve")
+            await run_for(val, units, freeze="preserve", clk=clk_param)
             return 0
 
+        domain = _get_clk(clk_param)
+
         if granularity == "edge":
-            clkh = clk_param or clk_handle
+            clkh = domain["handle"]
             if clkh is None:
-                # Fallback to half-period manual toggle
-                half_ps = int(round(float(CLK["period_ns"]) * 1_000.0 / 2.0))
-                await _temp_free_run_for_ps(half_ps, freeze="preserve")
+                half_ps = int(round(float(domain["period_ns"]) * 1_000.0 / 2.0))
+                await _temp_free_run_for_ps(half_ps, freeze="preserve", clk=clk_param)
                 return 0
             await RisingEdge(clkh)
             return 0
 
         # default: "cycle"
-        if CLK["task"] is not None:
-            clkx = clk_param or clk_handle
+        if domain["task"] is not None:
+            clkx = domain["handle"]
             if clkx is None:
-                await _temp_free_run_for_ps(int(round(float(CLK["period_ns"]) * 1_000.0)), freeze="preserve")
+                await _temp_free_run_for_ps(int(round(float(domain["period_ns"]) * 1_000.0)), freeze="preserve", clk=clk_param)
                 return 1
             await RisingEdge(clkx)
             await FallingEdge(clkx)
             return 1
 
-        await cycles(1)
+        await cycles(1, clk=clk_param)
         return 1
 
     async def _eval_state_spec_one(spec) -> bool:
@@ -1060,6 +1083,29 @@ async def cocodbg(dut):
         "wait_until": wait_until,
     }
 
+    def register_clock(name: str, signal, period_ns: float | None = None):
+        """Register a named clock domain. signal can be a DUT handle or attribute name string."""
+        if isinstance(signal, str):
+            signal = getattr(dut, signal, None)
+        CLOCKS[name] = {
+            "handle": signal,
+            "task": None,
+            "period_ns": float(period_ns) if period_ns is not None else _CLK_PERIOD_NS,
+        }
+
+    def show_clocks():
+        """Print all registered clock domains and their current state."""
+        for name, domain in CLOCKS.items():
+            h = domain["handle"]
+            sig_name = getattr(h, "_name", "?") if h is not None else "None"
+            running = domain["task"] is not None
+            print(f"  {name!r}: signal={sig_name}, period={domain['period_ns']}ns, running={running}")
+
+    async def stop_all_clocks(freeze: str = "low"):
+        """Stop all running clock domains."""
+        for name in list(CLOCKS):
+            await stop_clock(freeze=freeze, clk=name)
+
     def show_sigs():
         _ensure_vcd_initialized()
         for name, sig in VCD["pairs"]:
@@ -1081,7 +1127,10 @@ async def cocodbg(dut):
         _ensure_vcd_initialized()
         return [name for name, _ in VCD["pairs"]]
 
-    exec_globals.update({"show_sigs": show_sigs, "show_vars": show_vars, "list_signals": list_signals})
+    exec_globals.update({
+        "show_sigs": show_sigs, "show_vars": show_vars, "list_signals": list_signals,
+        "register_clock": register_clock, "stop_all_clocks": stop_all_clocks, "show_clocks": show_clocks,
+    })
     _initial_exec_names = frozenset(exec_globals)
 
     def _cmpwrap(op):

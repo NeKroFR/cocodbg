@@ -358,6 +358,7 @@ _BUILTIN_NAMES = frozenset({
     "run_for", "cycles", "as_uint", "as_sint", "start_vcd", "stop_vcd",
     "gen_vcd", "view_vcd", "gtkwave_live_start", "gtkwave_live_stop",
     "wait_until", "show_sigs", "show_vars", "list_signals",
+    "register_clock", "stop_all_clocks", "show_clocks",
 })
 
 _COLON_CMDS = [
