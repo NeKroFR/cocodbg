@@ -6,6 +6,11 @@ _RESERVED_GLOBALS = {
     "dut", "clk", "cocotb", "Timer", "RisingEdge", "FallingEdge",
     "Clock", "BinaryValue",
     "start_clock", "stop_clock", "set_clock_rate", "step", "run_for", "cycles",
+    "as_uint", "as_sint",
+    "start_vcd", "stop_vcd", "gen_vcd", "view_vcd",
+    "gtkwave_live_start", "gtkwave_live_stop",
+    "wait_until", "show_sigs", "show_vars", "list_signals", "sim_time",
+    "register_clock", "stop_all_clocks", "show_clocks",
 }
 
 

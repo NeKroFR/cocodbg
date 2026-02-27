@@ -2,3 +2,7 @@ __pycache__/
 sim_build/
 adder
 *.o
+e~*.o
+dist/
+*.egg-info/
+.cocodbg/

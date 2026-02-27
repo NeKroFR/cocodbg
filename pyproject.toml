@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cocodbg"
+version = "0.1.0"
+description = "Interactive debugger for cocotb simulations"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+dependencies = ["cocotb"]
+
+[project.scripts]
+cocodbg = "cocodbg.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["cocodbg*"]

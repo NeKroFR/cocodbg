@@ -50,7 +50,6 @@ async def cocodbg(dut):
     CLOCKS = {
         "default": {"handle": clk_handle, "task": None, "period_ns": _CLK_PERIOD_NS},
     }
-    CLK = CLOCKS["default"]  # backwards-compat alias
 
     def _get_clk(clk=None):
         if clk is None:
@@ -339,7 +338,7 @@ async def cocodbg(dut):
         "ids": {},            # handle -> vcd_id
         "events": [],         # list[(time_ps, vid, change_line)]
         "last": {},           # vid -> last change_line committed
-        "rec_active": False,
+        "rec_active": True,
 
         "live": {
             "proc_shmidcat": None,
@@ -482,6 +481,8 @@ async def cocodbg(dut):
     def _emit_events(time_ps: int, vid_to_change: dict[str, str]):
         if not vid_to_change:
             return
+        if not VCD["rec_active"]:
+            return
         order_vids = VCD["live"]["order_vids"] or [VCD["ids"][s] for _, s in VCD["pairs"]]
         for vid in order_vids:
             ch = vid_to_change.get(vid)
@@ -515,6 +516,13 @@ async def cocodbg(dut):
     # -------- File VCD dump --------
     async def start_vcd(signals=None):
         _ensure_vcd_initialized()
+        # Capture current signal state into VCD["last"], then start a fresh recording.
+        for _, sig in VCD["pairs"]:
+            vid = VCD["ids"][sig]
+            VCD["last"][vid] = _fmt_change(sig, vid)
+        VCD["events"].clear()
+        if VCD["live"]["drain_task"] is not None:
+            VCD["live"]["drain_idx"] = 0
         VCD["rec_active"] = True
 
     async def stop_vcd():
@@ -530,15 +538,21 @@ async def cocodbg(dut):
         base = os.environ.get("COCODBG_ROOT", os.getcwd())
         return path if os.path.isabs(path) else os.path.join(base, path)
 
-    async def gen_vcd(path: str, *, timescale: str = "ns"):
+    async def gen_vcd(path: str, *, timescale: str = "ns", signals=None):
         _ensure_vcd_initialized()
         _snapshot_commit_now()
 
         out_path = _resolve_out_path(path)
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        _out_dir = os.path.dirname(out_path)
+        if _out_dir:
+            os.makedirs(_out_dir, exist_ok=True)
 
         pairs = VCD["pairs"]
-        selected_ids = set(VCD["ids"][sig] for _, sig in pairs)
+        if signals is not None:
+            sig_set = set(signals)
+            selected_ids = {VCD["ids"][sig] for name, sig in pairs if name in sig_set}
+        else:
+            selected_ids = set(VCD["ids"][sig] for _, sig in pairs)
 
         if VCD["events"]:
             t_start = VCD["events"][0][0]
@@ -696,7 +710,11 @@ async def cocodbg(dut):
             await gtkwave_live_stop(kill_viewer=True)
 
         pairs = VCD["pairs"]
-        selected_ids = None
+        if signals is not None:
+            sig_set = set(signals)
+            selected_ids = {VCD["ids"][sig] for name, sig in pairs if name in sig_set}
+        else:
+            selected_ids = None
         VCD["rec_active"] = True
 
         try:
@@ -1106,6 +1124,10 @@ async def cocodbg(dut):
         for name in list(CLOCKS):
             await stop_clock(freeze=freeze, clk=name)
 
+    def sim_time(units: str = "ns"):
+        """Return current simulation time."""
+        return get_sim_time(units=units)
+
     def show_sigs():
         _ensure_vcd_initialized()
         for name, sig in VCD["pairs"]:
@@ -1130,6 +1152,7 @@ async def cocodbg(dut):
     exec_globals.update({
         "show_sigs": show_sigs, "show_vars": show_vars, "list_signals": list_signals,
         "register_clock": register_clock, "stop_all_clocks": stop_all_clocks, "show_clocks": show_clocks,
+        "sim_time": sim_time,
     })
     _initial_exec_names = frozenset(exec_globals)
 

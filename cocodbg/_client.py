@@ -22,13 +22,13 @@ _BUILTIN_NAMES = frozenset({
     "BinaryValue", "start_clock", "stop_clock", "set_clock_rate", "step",
     "run_for", "cycles", "as_uint", "as_sint", "start_vcd", "stop_vcd",
     "gen_vcd", "view_vcd", "gtkwave_live_start", "gtkwave_live_stop",
-    "wait_until", "show_sigs", "show_vars", "list_signals",
+    "wait_until", "show_sigs", "show_vars", "list_signals", "sim_time",
     "register_clock", "stop_all_clocks", "show_clocks",
 })
 
 _COLON_CMDS = [
     ":quit", ":q", ":clear", ":cls", ":stepback", ":rewind",
-    ":n", ":c", ":p", ":b", ":r", ":vars", ":sig",
+    ":n", ":c", ":p", ":b", ":r", ":vars", ":sig", ":help", ":h",
 ]
 
 
@@ -52,9 +52,57 @@ def _make_completer(user_names: set[str]):
     return completer
 
 
+_HISTORY_FILE = os.path.expanduser("~/.cocodbg_history")
+
+
 def _history_init():
     readline.set_auto_history(False)
     readline.clear_history()
+    with contextlib.suppress(Exception):
+        readline.read_history_file(_HISTORY_FILE)
+
+
+def _history_save():
+    with contextlib.suppress(Exception):
+        readline.write_history_file(_HISTORY_FILE)
+
+
+def _print_help():
+    print(
+        "colon commands:\n"
+        "  :q / :quit          stop simulation and exit\n"
+        "  :r / :restart       restart simulation, replay all previous inputs\n"
+        "  :stepback N         replay up to N submissions back\n"
+        "  :n                  step one clock cycle (alias for await step())\n"
+        "  :c [N] [unit]       advance N cycles or run_for N unit\n"
+        "  :b <expr>           wait until lambda: <expr> is true\n"
+        "  :p <expr>           print <expr>\n"
+        "  :vars               show user-defined variables\n"
+        "  :sig                show all DUT signals\n"
+        "  :clear / :cls       clear the terminal\n"
+        "  :help / :h          show this help\n"
+        "\n"
+        "built-in functions (use with await where needed):\n"
+        "  cycles(n)                 advance n clock cycles\n"
+        "  run_for(t, units)         advance t time (ns/us/ms/ps/fs/s)\n"
+        "  sim_time(units)           current simulation time\n"
+        "  start_clock()             start the default free-running clock\n"
+        "  stop_clock()              stop the clock\n"
+        "  set_clock_rate(t, units)  change clock period\n"
+        "  wait_until(cond)          wait for a signal condition\n"
+        "  register_clock(n, sig)    register a named clock domain\n"
+        "  show_clocks()             list clock domains\n"
+        "  stop_all_clocks()         stop all running clocks\n"
+        "  show_sigs()               print all DUT signals\n"
+        "  show_vars()               print user-defined variables\n"
+        "  gen_vcd(path)             write VCD to file\n"
+        "  view_vcd(path)            open VCD in GTKWave\n"
+        "  start_vcd()               start a fresh VCD recording window\n"
+        "  stop_vcd()                stop recording\n"
+        "  gtkwave_live_start()      stream live VCD to GTKWave\n"
+        "  gtkwave_live_stop()       stop live stream\n"
+        "  as_uint(x) / as_sint(x)  read signal as unsigned/signed int"
+    )
 
 
 def _history_add_line(line: str):
@@ -209,7 +257,35 @@ def _client_loop(sim_dir: str, host: str = "127.0.0.1", port: int = 9999):
             pass
 
     def _bracket_delta(s: str) -> int:
-        return (s.count("(") - s.count(")")) + (s.count("[") - s.count("]")) + (s.count("{") - s.count("}"))
+        depth = 0
+        i = 0
+        n = len(s)
+        while i < n:
+            ch = s[i]
+            if ch in ('"', "'"):
+                q = s[i:i+3]
+                if q in ('"""', "'''"):
+                    close = s.find(q, i + 3)
+                    i = (close + 3) if close != -1 else n
+                    continue
+                i += 1
+                while i < n:
+                    if s[i] == "\\" :
+                        i += 2
+                        continue
+                    if s[i] == ch:
+                        i += 1
+                        break
+                    i += 1
+                continue
+            if ch == "#":
+                break
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            i += 1
+        return depth
 
     def _strip_comment(line: str) -> str:
         in_str = None
@@ -267,10 +343,15 @@ def _client_loop(sim_dir: str, host: str = "127.0.0.1", port: int = 9999):
                 continue
 
             if line.strip() in (":quit", ":q"):
+                _history_save()
                 _close_conn_only()
                 if sim_proc is not None:
                     _terminate_sim(sim_proc, host, port)
                 break
+
+            if not buf and not in_triple and line.strip() in (":help", ":h"):
+                _print_help()
+                continue
 
             if not buf and not in_triple and line.strip() in (":clear", ":cls"):
                 print("\033[2J\033[H", end="", flush=True)
@@ -407,6 +488,7 @@ def _client_loop(sim_dir: str, host: str = "127.0.0.1", port: int = 9999):
 
     except KeyboardInterrupt:
         print("\n# Caught KeyboardInterrupt, cleaning up...")
+        _history_save()
         _close_conn_only()
         if sim_proc is not None:
             _terminate_sim(sim_proc, host, port)
