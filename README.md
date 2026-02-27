@@ -35,7 +35,7 @@ pip install -e .
 
 Drop a script next to your HDL sources and run it:
 
-```python
+```py
 from cocodbg import CocotbDebugConfig
 
 CocotbDebugConfig(
@@ -59,7 +59,7 @@ CocotbDebugConfig(
 
 ## CocotbDebugConfig reference
 
-```python
+```py
 CocotbDebugConfig(
     toplevel,
     sources,
@@ -88,7 +88,7 @@ CocotbDebugConfig(
 
 `extra_args` keys and values are written directly as Makefile variables:
 
-```python
+```py
 # GHDL with VHDL 2008
 CocotbDebugConfig(..., extra_args={"GHDL_ARGS": "--std=08"})
 
@@ -145,12 +145,19 @@ The executor inside the simulation reads its configuration from environment vari
 
 Type Python at the `>>>` prompt. Single lines submit on Enter. Lines ending with `:` open a block; close it with a blank line. Open brackets (`(`, `[`, `{`) work the same way; the REPL waits until they close.
 
-```python
+```py
 >>> dut.a.value = 5
+[OK] None
 >>> dut.b.value = 3
+[OK] None
 >>> await cycles(2)
->>> print(dut.sum.value)
-8
+[OK] None
+>>> dut.sum.value
+[OK] 00001000
+>>> int(dut.sum.value)
+[OK] 8
+>>> hex(dut.sum.value)
+[OK] 0x8
 ```
 
 `^C` cancels the running block and drops back to the prompt. The simulation keeps going.
@@ -183,7 +190,7 @@ Tab completion works for built-in names, DUT signal paths (`dut.`), and colon co
 
 All functions in this table are `async` and must be awaited, except `sim_time` which is synchronous.
 
-```python
+```py
 >>> await cycles(10)          # advance 10 clock cycles
 >>> await run_for(100, "ns")  # advance 100 ns
 >>> await step()              # advance one simulation delta
@@ -204,7 +211,7 @@ All functions in this table are `async` and must be awaited, except `sim_time` w
 
 ### Signal access
 
-```python
+```py
 >>> dut.a.value = 42            # write a signal
 >>> print(dut.sum.value)        # read a signal
 >>> print(as_uint(dut.result))  # read as unsigned int
@@ -222,7 +229,7 @@ Comparison operators (`<`, `<=`, `>`, `>=`, `==`, `!=`) work directly on cocotb 
 
 ### Waiting for conditions
 
-```python
+```py
 >>> await wait_until(lambda: dut.ready.value == 1)
 
 >>> await wait_until({"dut.ready": 1, "dut.valid": 1})
@@ -273,7 +280,7 @@ Returns a dict: `{"hit": bool, "which": int|None, "cycles": int, "iters": int, "
 
 #### File VCD
 
-```python
+```py
 >>> await start_vcd()           # start a fresh recording window (optional)
 >>> await cycles(20)
 >>> await stop_vcd()            # stop recording (optional)
@@ -282,7 +289,7 @@ Returns a dict: `{"hit": bool, "which": int|None, "cycles": int, "iters": int, "
 
 The VCD records everything from simulation start by default. `start_vcd()` resets the recording window to now.
 
-```python
+```py
 # Record only specific signals
 >>> await gen_vcd("trace.vcd", signals=["clk", "a", "sum"])
 ```
@@ -291,7 +298,7 @@ The VCD records everything from simulation start by default. `start_vcd()` reset
 
 Requires `shmidcat` and `gtkwave` in PATH (override with `shmidcat_path`/`gtkwave_path` if needed).
 
-```python
+```py
 >>> await gtkwave_live_start()
 >>> await cycles(100)
 >>> await gtkwave_live_stop()
@@ -316,7 +323,7 @@ Requires `shmidcat` and `gtkwave` in PATH (override with `shmidcat_path`/`gtkwav
 
 ### Multiple clock domains
 
-```python
+```py
 >>> register_clock("fast", dut.clk_fast, period_ns=2.0)
 >>> register_clock("slow", dut.clk_slow, period_ns=20.0)
 
@@ -346,7 +353,7 @@ The `clk=` parameter on all time-control functions accepts a domain name string,
 
 ### Variables and inspection
 
-```python
+```py
 >>> x = 42
 >>> show_vars()
   x = 42
@@ -385,7 +392,7 @@ These cocotb objects are pre-imported in the REPL:
 | `Clock` | `cocotb.clock.Clock` |
 | `BinaryValue` | `cocotb.binary.BinaryValue` |
 
-```python
+```py
 >>> await RisingEdge(dut.clk)
 >>> await Timer(100, units="ns")
 ```
@@ -396,7 +403,7 @@ These cocotb objects are pre-imported in the REPL:
 
 cocodbg tracks every submitted block. `:r` restarts the simulation and replays them all; `:stepback N` replays all but the last N.
 
-```python
+```py
 >>> dut.a.value = 5
 >>> await cycles(10)
 >>> dut.b.value = 3  # made a mistake here
