@@ -125,7 +125,7 @@ def _client_loop(sim_dir: str, host: str = "127.0.0.1", port: int = 9999):
     def _connect_new_sim():
         nonlocal sim_proc, last_connect_info
         _preflight_cleanup(host, port)
-        sim_proc, _ = _launch_sim(sim_dir)
+        sim_proc, _ = _launch_sim(sim_dir, port)
         print(f"waiting for {host}:{port} ...")
         if not _wait_for_port_open(host, port, timeout=60.0):
             print("Error: debugger port did not open in time.")
@@ -509,8 +509,8 @@ def start_sim(sim_dir: str, host: str = "127.0.0.1", port: int = 9999):
     try:
         _client_loop(sim_dir, host, port)
     finally:
-        pid = _read_pidfile()
+        pid = _read_pidfile(port)
         if pid:
             _kill_process_group_by_pid(pid)
-            _remove_pidfile()
+        _remove_pidfile(port)
         _wait_for_port_closed(host, port, timeout=5.0)

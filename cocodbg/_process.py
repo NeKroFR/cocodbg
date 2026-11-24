@@ -13,30 +13,56 @@ def _state_dir() -> str:
     return d
 
 
-def _pidfile_path() -> str:
-    return os.path.join(_state_dir(), "sim.pid")
+def _pidfile_path(port: int | None = None) -> str:
+    """One pidfile per debugger port, so two sessions in one directory do not kill each other."""
+    name = "sim.pid" if port is None else f"sim-{port}.pid"
+    return os.path.join(_state_dir(), name)
 
 
-def _write_pidfile(pid: int):
+def _proc_start_time(pid: int) -> str | None:
+    """Start time of pid in clock ticks since boot (field 22 of /proc/pid/stat), or None."""
     try:
-        with open(_pidfile_path(), "w") as f:
-            f.write(str(pid))
+        with open(f"/proc/{pid}/stat", "r") as f:
+            stat = f.read()
+        # comm may contain spaces and parentheses, so split after the last ')'.
+        return stat.rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def _write_pidfile(pid: int, port: int | None = None):
+    start = _proc_start_time(pid)
+    if start is None:
+        return
+    try:
+        with open(_pidfile_path(port), "w") as f:
+            f.write(f"{pid} {start}")
     except Exception:
         pass
 
 
-def _read_pidfile() -> int | None:
+def _read_pidfile(port: int | None = None) -> int | None:
+    """Return the recorded pid only if that exact process is still alive.
+
+    A pid that exited and was reused by an unrelated process has a different start time.
+    Files without a start time are ignored rather than trusted.
+    """
     try:
-        with open(_pidfile_path(), "r") as f:
-            s = f.read().strip()
-        return int(s) if s else None
+        with open(_pidfile_path(port), "r") as f:
+            parts = f.read().split()
+        if len(parts) != 2:
+            return None
+        pid = int(parts[0])
     except Exception:
         return None
+    if _proc_start_time(pid) != parts[1]:
+        return None
+    return pid
 
 
-def _remove_pidfile():
+def _remove_pidfile(port: int | None = None):
     with contextlib.suppress(Exception):
-        os.remove(_pidfile_path())
+        os.remove(_pidfile_path(port))
 
 
 def _tail_proc(proc: subprocess.Popen):
@@ -100,14 +126,14 @@ def _kill_process_group_by_pid(pid: int):
 
 
 def _preflight_cleanup(host: str, port: int):
-    pid = _read_pidfile()
+    pid = _read_pidfile(port)
     if pid:
         _kill_process_group_by_pid(pid)
-        _remove_pidfile()
+    _remove_pidfile(port)
     _wait_for_port_closed(host, port, timeout=5.0)
 
 
-def _launch_sim(sim_dir: str) -> tuple[subprocess.Popen, tuple[threading.Thread, threading.Thread]]:
+def _launch_sim(sim_dir: str, port: int | None = None) -> tuple[subprocess.Popen, tuple[threading.Thread, threading.Thread]]:
     env = os.environ.copy()
     extra_py = os.path.abspath(".") + os.pathsep + os.path.abspath(sim_dir)
     env["PYTHONPATH"] = extra_py + os.pathsep + env.get("PYTHONPATH", "")
@@ -121,7 +147,7 @@ def _launch_sim(sim_dir: str) -> tuple[subprocess.Popen, tuple[threading.Thread,
         env=env,
         start_new_session=True,
     )
-    _write_pidfile(sim_proc.pid)
+    _write_pidfile(sim_proc.pid, port)
     tails = _tail_proc(sim_proc)
     return sim_proc, tails
 
@@ -145,4 +171,4 @@ def _terminate_sim(sim_proc: subprocess.Popen, host: str = "127.0.0.1", port: in
                     sim_proc.wait(timeout=3)
     finally:
         _wait_for_port_closed(host, port, timeout=10.0)
-        _remove_pidfile()
+        _remove_pidfile(port)
