@@ -1,5 +1,7 @@
 import ast
+import io
 import sys
+import tokenize
 import traceback
 
 _RESERVED_GLOBALS = {
@@ -104,6 +106,44 @@ def _assigned_at_toplevel(tree: ast.Module) -> set[str]:
     return {n for n in assigned if n not in _RESERVED_GLOBALS}
 
 
+def _string_continuation_lines(code: str) -> set[int]:
+    """0-based indices of lines that continue a multi-line string token.
+
+    Indenting these would change the string value, so the wrapper leaves them alone.
+    """
+    protected: set[int] = set()
+    fstart = getattr(tokenize, "FSTRING_START", None)
+    fend = getattr(tokenize, "FSTRING_END", None)
+    depth = 0
+    open_row = 0
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(code).readline):
+            if tok.type == tokenize.STRING:
+                protected.update(range(tok.start[0], tok.end[0]))
+            elif fstart is not None and tok.type == fstart:
+                if depth == 0:
+                    open_row = tok.start[0]
+                depth += 1
+            elif fend is not None and tok.type == fend:
+                depth -= 1
+                if depth == 0:
+                    protected.update(range(open_row, tok.end[0]))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return set()
+    return protected
+
+
+def _indent_lines(lines: list[str], protected: set[int]) -> list[str]:
+    """Indent code lines by one level. Blank lines stay empty and string bodies stay intact."""
+    out = []
+    for i, ln in enumerate(lines):
+        if i in protected or not ln.strip():
+            out.append(ln if i in protected else "")
+        else:
+            out.append("    " + ln)
+    return out
+
+
 def wrap_code_as_async(code: str) -> str:
     """
     Wrap arbitrary user code into an async function __user_main__().
@@ -158,18 +198,21 @@ def wrap_code_as_async(code: str) -> str:
             expr_src = ast.get_source_segment(code, last.value)
             if not expr_src:
                 expr_src = "\n".join(lines[start:end + 1]).strip()
-            kept = lines[:start] + lines[end + 1:]
+            keep_idx = [i for i in range(len(lines)) if i < start or i > end]
+            kept = [lines[i] for i in keep_idx]
+            protected_all = _string_continuation_lines(code)
+            kept_protected = {n for n, i in enumerate(keep_idx) if i in protected_all}
             kept_src = "\n".join(kept)
             if _is_only_comments_or_blank(kept_src) or _is_only_docstrings(kept_src):
                 indented = ["    pass"]
             else:
-                indented = [("    " + ln) if ln.strip() else "    pass" for ln in kept]
+                indented = _indent_lines(kept, kept_protected)
             body = globals_line + ("\n".join(indented) + ("\n" if indented else "")) + f"    return ({expr_src})"
             return f"async def __user_main__():\n{body}\n"
     except Exception:
         pass
 
-    indented = [("    " + ln) if ln.strip() else "    pass" for ln in code.splitlines()]
+    indented = _indent_lines(code.splitlines(), _string_continuation_lines(code))
     body_core = "\n".join(indented) or "    pass"
     body = (globals_line + body_core) if globals_line else body_core
     return f"async def __user_main__():\n{body}\n"
