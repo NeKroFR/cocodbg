@@ -3,6 +3,8 @@ import threading
 import queue
 import contextlib
 import select
+
+from ._framing import escape_line
 from typing import Tuple
 
 Command = Tuple[str, "queue.Queue[str]", Tuple[str, int]]
@@ -97,7 +99,7 @@ class CocotbDebugger:
                     try:
                         self._send_line(conn_file, b"<<BEGIN>>")
                         for ln in reply.splitlines():
-                            self._send_line(conn_file, ln.encode("utf-8", "replace"))
+                            self._send_line(conn_file, escape_line(ln).encode("utf-8", "replace"))
                         self._send_line(conn_file, b"<<END>>")
                     except Exception:
                         break

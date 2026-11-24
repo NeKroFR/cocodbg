@@ -7,6 +7,7 @@ import re
 import contextlib
 
 from ._ast import _assigned_at_toplevel
+from ._framing import unescape_line
 from ._process import (
     _preflight_cleanup, _launch_sim, _terminate_sim,
     _wait_for_port_open, _wait_for_port_closed, _open_connection,
@@ -197,7 +198,7 @@ def _client_loop(sim_dir: str, host: str = "127.0.0.1", port: int = 9999):
                 print(banner2)
                 return "[OK] # cancelled by user"
             if ln == "<<END>>": break
-            payload_lines.append(ln)
+            payload_lines.append(unescape_line(ln))
         payload = "\n".join(payload_lines)
         if print_reply:
             print(_fmt_reply(payload) if sys.stdout.isatty() else payload)
